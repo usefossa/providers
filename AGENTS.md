@@ -1,6 +1,6 @@
 # providers
 
-provider cli, rust sdk and metadata schema for fossa. [documentation](https://fossa.ag/docs/providers/cli).
+fossa cli, rust sdk and metadata schema for fossa. [documentation](https://fossa.ag/docs/providers/cli).
 
 - `sdk/rust/`: complete protocol sdk; offline builders, typed accounts, pooled rpc and signing.
 - `cli/`: noninteractive rust binary using sdk. help and linked website docs replace skills.

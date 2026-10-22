@@ -77,16 +77,16 @@ jobs:
             export RUSTFLAGS='-C linker=musl-gcc'
           fi
           cargo test --workspace --locked --target "$TARGET"
-          cargo build --release --locked -p fossa-provider --target "$TARGET"
+          cargo build --release --locked -p fossa-cli --target "$TARGET"
           binary="target/$TARGET/release/fossa"
           test "$("$binary" --version)" = "fossa ${RELEASE_TAG#v}"
           "$binary" --help >/dev/null
           mkdir dist
-          cp "$binary" "dist/fossa-provider-$TARGET"
+          cp "$binary" "dist/fossa-$TARGET"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: fossa-provider-${{ matrix.target }}
-          path: dist/fossa-provider-${{ matrix.target }}
+          name: fossa-${{ matrix.target }}
+          path: dist/fossa-${{ matrix.target }}
           if-no-files-found: error
           compression-level: 0
           retention-days: 1
@@ -99,10 +99,10 @@ jobs:
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
-          pattern: fossa-provider-*
+          pattern: fossa-*
           merge-multiple: true
           path: dist
-      - name: manifest and private release
+      - name: manifest and release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -113,11 +113,11 @@ jobs:
           import { readFileSync, writeFileSync } from 'node:fs';
           const targets = {};
           for (const target of ['x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl', 'x86_64-apple-darwin', 'aarch64-apple-darwin']) {
-            const bytes = readFileSync(`dist/fossa-provider-${target}`);
+            const bytes = readFileSync(`dist/fossa-${target}`);
             targets[target] = { sha256: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length };
           }
           const version = process.env.RELEASE_TAG.slice(1);
           if (!/^\d+\.\d+\.\d+$/.test(version)) throw Error('invalid release version');
           writeFileSync('dist/manifest.json', JSON.stringify({ version, targets }, null, 2) + '\n');
           JS
-          gh release create "$RELEASE_TAG" dist/* --verify-tag --title "$RELEASE_TAG" --notes 'provider sdk, cli and metadata schema'
+          gh release create "$RELEASE_TAG" dist/* --verify-tag --title "$RELEASE_TAG" --notes 'Fossa CLI, Rust SDK, and metadata schema.'

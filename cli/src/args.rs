@@ -5,7 +5,7 @@ use std::path::PathBuf;
 pub const DOCS: &str = "docs: https://fossa.ag/docs/providers/cli.md\nsdk: https://fossa.ag/docs/providers/sdk.md\nstart: https://fossa.ag/docs/providers/quick-start.md";
 
 #[derive(Parser, Debug)]
-#[command(name = "fossa", version, styles = help_styles(), about = "Inspect and manage Fossa providers; mutations plan until --execute", after_help = DOCS)]
+#[command(name = "fossa", version, styles = help_styles(), about = "Inspect and manage Fossa accounts, providers and bookings; mutations plan until --execute", after_help = DOCS)]
 pub struct Cli {
     #[command(flatten)]
     pub options: Options,

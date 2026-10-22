@@ -747,6 +747,7 @@ fn no_arguments_show_help_successfully_and_json_flag_keeps_pipes_compact() {
     assert!(help.stderr.is_empty());
     let help = String::from_utf8(help.stdout).unwrap();
     assert!(help.contains("Usage: fossa"));
+    assert!(help.contains("Fossa accounts, providers and bookings"));
     assert!(help.contains("--json"));
     assert!(!help.contains("fossa-provider"));
     assert!(!help.contains("help-secret"));
