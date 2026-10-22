@@ -405,8 +405,30 @@ fn inference_v1_v2_headers_verify_exact_body_owner_booking_and_deadline() {
         let state = Booking::decode(&address, &raw, &p.program).unwrap();
         let auth = inference::Authorization::sign(&p, address, &state, body, &signer, 500).unwrap();
         let decoded = inference::Authorization::from_headers(&auth.headers().unwrap()).unwrap();
+        let verifier = inference::RequestVerifier::new(&p, state.provider);
+        let checked = verifier.verify(&auth.headers().unwrap(), body).unwrap();
+        checked.verify_booking(address, &state, 500).unwrap();
+        assert!(verifier.verify(&auth.headers().unwrap(), b"wrong").is_err());
+        assert!(
+            inference::RequestVerifier::new(&p, key(10))
+                .verify(&auth.headers().unwrap(), body)
+                .is_err()
+        );
         assert_eq!(decoded, auth);
         decoded.verify(&p, address, &state, body, 500).unwrap();
+        let verified = decoded.verify_signature(&p, state.provider, body).unwrap();
+        verified.verify_booking(address, &state, 500).unwrap();
+        let mut wrong = state.clone();
+        wrong.provider = key(10);
+        assert!(verified.verify_booking(address, &wrong, 500).is_err());
+        wrong = state.clone();
+        wrong.market = key(10);
+        assert!(verified.verify_booking(address, &wrong, 500).is_err());
+        wrong = state.clone();
+        wrong.is_receipt_case = true;
+        assert!(verified.verify_booking(address, &wrong, 500).is_err());
+        assert!(verified.verify_booking(address, &state, 1000).is_err());
+        assert!(decoded.verify_signature(&p, key(10), body).is_err());
         assert!(decoded.verify(&p, address, &state, b"wrong", 500).is_err());
         assert!(decoded.verify(&p, key(7), &state, body, 500).is_err());
         assert!(decoded.verify(&p, address, &state, body, 1001).is_err());
@@ -533,4 +555,204 @@ async fn real_json_wire_uses_base58_keys_for_config_accounts_and_discovery() {
             .unwrap(),
         vec![(p.market, market)]
     );
+}
+
+#[tokio::test]
+async fn provider_reads_preserve_commitment_context_and_null_results() {
+    use fossa_sdk::rpc::Commitment;
+    let mock = spawn_mock(|_, _, body| {
+        let q: Value = serde_json::from_slice(body).unwrap();
+        let options = &q["params"][1];
+        let result = match q["method"].as_str().unwrap() {
+            "getAccountInfo" => {
+                assert_eq!(options["commitment"], "processed");
+                assert_eq!(options["minContextSlot"], 10);
+                json!({"context":{"slot":10},"value":null})
+            }
+            "getMultipleAccounts" => {
+                assert_eq!(options["commitment"], "confirmed");
+                assert_eq!(options["minContextSlot"], 10);
+                json!({"context":{"slot":9},"value":[null]})
+            }
+            "getProgramAccounts" => {
+                assert_eq!(options["commitment"], "confirmed");
+                assert_eq!(options["withContext"], true);
+                json!({"context":{"slot":12},"value":[{"pubkey":key(2).to_string(),"account":{"owner":key(1).to_string(),"lamports":1,"executable":false,"data":["AQ==","base64"]}}]})
+            }
+            "getTransaction" => Value::Null,
+            _ => panic!("unexpected method"),
+        };
+        rpc_response(body, result)
+    }).await;
+    let rpc = RpcClient::new(&mock.url).unwrap();
+    assert_eq!(rpc.commitment(), Commitment::Confirmed);
+    let read = rpc
+        .clone()
+        .with_commitment(Commitment::Processed)
+        .raw_account_at(key(1), 10)
+        .await
+        .unwrap();
+    assert_eq!(read.context.slot, 10);
+    assert!(read.value.is_none());
+    assert!(rpc.multiple_accounts_at(&[key(1)], 10).await.is_err());
+    let snapshot = rpc.program_snapshot(key(1), vec![]).await.unwrap();
+    assert_eq!(snapshot.context.slot, 12);
+    assert_eq!(snapshot.value[0].1.data, vec![1]);
+    assert!(
+        rpc.transaction(&Signature::default())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn blockhash_reuse_coalesces_refreshes_and_respects_slots_age_and_commitment() {
+    use fossa_sdk::rpc::Commitment;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let mock = spawn_mock(move |_, _, body| {
+        let q: Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(q["method"], "getLatestBlockhash");
+        count.fetch_add(1, Ordering::Relaxed);
+        let slot = q["params"][0]["minContextSlot"].as_u64().unwrap().max(9);
+        rpc_response(body, json!({"context":{"slot":slot},"value":{"blockhash":Hash::new_from_array([8;32]).to_string(),"lastValidBlockHeight":100}}))
+    }).await;
+    let rpc = RpcClient::new(&mock.url).unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..24 {
+        let rpc = rpc.clone();
+        tasks.spawn(async move {
+            rpc.prepare_cached(
+                &[protocol().approve_provider(key(5), key(7), true)],
+                key(7),
+                0,
+            )
+            .await
+            .unwrap()
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        assert_eq!(result.unwrap().min_context_slot, 9);
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let instructions = [protocol().approve_provider(key(5), key(7), true)];
+    assert_eq!(
+        rpc.prepare_cached(&instructions, key(7), 12)
+            .await
+            .unwrap()
+            .min_context_slot,
+        12
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    rpc.clone()
+        .with_commitment(Commitment::Processed)
+        .prepare_cached(&instructions, key(7), 0)
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
+    rpc.prepare_cached(&instructions, key(7), 0).await.unwrap();
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::time::resume();
+    rpc.prepare_cached(&instructions, key(7), 0).await.unwrap();
+    assert_eq!(calls.load(Ordering::Relaxed), 4);
+    rpc.invalidate_blockhash().await;
+    rpc.prepare_cached(&instructions, key(7), 0).await.unwrap();
+    assert_eq!(calls.load(Ordering::Relaxed), 5);
+}
+
+#[tokio::test]
+async fn cached_blockhash_rejects_stale_rpc_context() {
+    let mock = spawn_mock(|_, _, body| rpc_response(body, json!({"context":{"slot":9},"value":{"blockhash":Hash::new_from_array([8;32]).to_string(),"lastValidBlockHeight":100}}))).await;
+    let rpc = RpcClient::new(&mock.url).unwrap();
+    let ix = protocol().approve_provider(key(5), key(7), true);
+    assert!(rpc.prepare_cached(&[ix], key(7), 10).await.is_err());
+}
+
+#[tokio::test]
+async fn batch_status_and_explicit_broadcast_options_keep_signature_and_slot_bindings() {
+    use fossa_sdk::rpc::{Commitment, SendOptions};
+    let p = pending();
+    let signature = p.signature.clone();
+    let mock = spawn_mock(move |_, _, body| {
+        let q: Value = serde_json::from_slice(body).unwrap();
+        let result = match q["method"].as_str().unwrap() {
+            "getSignatureStatuses" => {
+                assert_eq!(q["params"][1]["searchTransactionHistory"], false);
+                json!({"context":{"slot":10},"value":[null,null]})
+            }
+            "sendTransaction" => {
+                assert_eq!(q["params"][1]["skipPreflight"], true);
+                assert_eq!(q["params"][1]["preflightCommitment"], "confirmed");
+                assert_eq!(q["params"][1]["maxRetries"], 0);
+                assert_eq!(q["params"][1]["minContextSlot"], 9);
+                json!(signature)
+            }
+            _ => panic!("unexpected method"),
+        };
+        rpc_response(body, result)
+    })
+    .await;
+    let rpc = RpcClient::new(&mock.url).unwrap();
+    let signature = p.validate().unwrap();
+    assert_eq!(
+        rpc.signature_statuses(&[signature; 2], false)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(rpc.signature_statuses(&[signature], false).await.is_err());
+    assert!(rpc.signature_statuses(&[], false).await.is_err());
+    assert!(
+        rpc.signature_statuses(&[signature; 257], false)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        rpc.broadcast_with_options(
+            &p,
+            SendOptions {
+                skip_preflight: true,
+                preflight_commitment: Commitment::Confirmed,
+                max_retries: 0
+            }
+        )
+        .await
+        .unwrap(),
+        signature
+    );
+}
+
+#[test]
+fn cached_verifier_keeps_strict_signature_checks_for_every_request() {
+    let p = protocol();
+    let verifier = inference::RequestVerifier::new(&p, key(9));
+    let body = b"request";
+    let signer = signer();
+    let mut auth = inference::Authorization {
+        booking: key(8),
+        owner: signer.pubkey(),
+        generation: 1,
+        body_sha256: fossa_sdk::metadata::sha256_hex(body),
+        signature: signer.sign_message(
+            inference::statement(&p, key(8), key(9), 1, body)
+                .unwrap()
+                .as_bytes(),
+        ),
+    };
+    for _ in 0..2 {
+        verifier.verify(&auth.headers().unwrap(), body).unwrap();
+    }
+    auth.signature = Signature::default();
+    assert!(verifier.verify(&auth.headers().unwrap(), body).is_err());
+    let mut weak_key = [0; 32];
+    weak_key[0] = 1;
+    let mut weak_signature = [0; 64];
+    weak_signature[0] = 1;
+    auth.owner = Pubkey::new_from_array(weak_key);
+    auth.signature = Signature::from(weak_signature);
+    assert!(verifier.verify(&auth.headers().unwrap(), body).is_err());
 }

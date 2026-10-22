@@ -596,16 +596,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "fossa-metadata"
-version = "0.1.0"
-dependencies = [
- "jsonschema",
- "serde_json",
-]
-
-[[package]]
 name = "fossa-cli"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -619,12 +611,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fossa-metadata"
+version = "0.1.0"
+dependencies = [
+ "jsonschema",
+ "serde_json",
+]
+
+[[package]]
 name = "fossa-sdk"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "bincode",
  "bs58",
+ "ed25519-dalek",
  "fossa-metadata",
  "rand 0.9.5",
  "reqwest",

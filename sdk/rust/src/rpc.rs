@@ -8,7 +8,7 @@ use crate::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::{Value, json};
+use serde_json::{Value, json, value::RawValue};
 use std::{
     str::FromStr,
     sync::{
@@ -34,11 +34,13 @@ enum Transport {
     },
     Hosted(HostedClient),
 }
+type CachedBlockhash = tokio::sync::Mutex<Option<(tokio::time::Instant, LatestBlockhash)>>;
 #[derive(Clone)]
 pub struct RpcClient {
     transport: Transport,
     commitment: Commitment,
     ids: Arc<AtomicU64>,
+    blockhash: Arc<[CachedBlockhash; 3]>,
 }
 impl std::fmt::Debug for RpcClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -55,6 +57,46 @@ pub struct Context {
 pub struct ContextValue<T> {
     pub context: Context,
     pub value: T,
+}
+#[derive(Clone, Debug, Deserialize)]
+pub struct LatestBlockhash {
+    pub blockhash: Hash,
+    pub last_valid_block_height: u64,
+    pub min_context_slot: u64,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct SendOptions {
+    pub skip_preflight: bool,
+    pub preflight_commitment: Commitment,
+    pub max_retries: usize,
+}
+impl Default for SendOptions {
+    fn default() -> Self {
+        Self {
+            skip_preflight: false,
+            preflight_commitment: Commitment::Confirmed,
+            max_retries: 3,
+        }
+    }
+}
+#[derive(Deserialize)]
+struct RpcError {
+    code: i64,
+    message: String,
+    data: Option<Value>,
+}
+#[derive(Deserialize)]
+struct Response<'a> {
+    jsonrpc: &'a str,
+    id: u64,
+    #[serde(default, borrow, deserialize_with = "present_result")]
+    result: Option<&'a RawValue>,
+    error: Option<RpcError>,
+}
+fn present_result<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<&'de RawValue>, D::Error> {
+    <&RawValue>::deserialize(d).map(Some)
 }
 #[derive(Deserialize)]
 struct WireAccount {
@@ -104,7 +146,7 @@ pub struct SignatureStatus {
     pub confirmation_status: Option<Commitment>,
 }
 impl SignatureStatus {
-    fn reached(&self, target: Commitment) -> bool {
+    pub fn reached(&self, target: Commitment) -> bool {
         match self.confirmation_status {
             Some(Commitment::Finalized) => true,
             Some(Commitment::Confirmed) => target != Commitment::Finalized,
@@ -127,6 +169,7 @@ impl RpcClient {
             transport: Transport::Own { http, url },
             commitment: Commitment::Confirmed,
             ids: Arc::new(AtomicU64::new(1)),
+            blockhash: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(None))),
         })
     }
     pub fn hosted(client: HostedClient) -> Self {
@@ -134,6 +177,7 @@ impl RpcClient {
             transport: Transport::Hosted(client),
             commitment: Commitment::Confirmed,
             ids: Arc::new(AtomicU64::new(1)),
+            blockhash: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(None))),
         }
     }
     pub fn with_commitment(mut self, commitment: Commitment) -> Self {
@@ -165,29 +209,47 @@ impl RpcClient {
                     .await?
             }
         };
-        let mut response: Value = serde_json::from_slice(&bytes)?;
+        let response: Response<'_> = serde_json::from_slice(&bytes)?;
         ensure(
-            response["jsonrpc"] == "2.0" && response["id"].as_u64() == Some(id),
+            response.jsonrpc == "2.0" && response.id == id,
             "JSON-RPC response identity",
         )?;
-        if let Some(error) = response.get("error") {
+        if let Some(error) = response.error {
             return Err(Error::Rpc {
-                code: error["code"].as_i64().unwrap_or(-32603),
-                message: error["message"].as_str().unwrap_or("RPC error").into(),
-                data: error.get("data").cloned(),
+                code: error.code,
+                message: error.message,
+                data: error.data,
             });
         }
-        ensure(response.get("result").is_some(), "JSON-RPC result")?;
-        Ok(serde_json::from_value(response["result"].take())?)
+        Ok(serde_json::from_str(
+            response
+                .result
+                .ok_or(Error::Invalid("JSON-RPC result"))?
+                .get(),
+        )?)
     }
     pub async fn raw_account(&self, address: Pubkey) -> Result<Option<RawAccount>> {
+        Ok(self.raw_account_at(address, 0).await?.value)
+    }
+    pub async fn raw_account_at(
+        &self,
+        address: Pubkey,
+        min_context_slot: u64,
+    ) -> Result<ContextValue<Option<RawAccount>>> {
         let result: ContextValue<Option<WireAccount>> = self
             .call(
                 "getAccountInfo",
-                json!([address.to_string(),{"encoding":"base64","commitment":self.commitment}]),
+                json!([address.to_string(), self.read_options(min_context_slot)]),
             )
             .await?;
-        result.value.map(WireAccount::decode).transpose()
+        ensure(
+            result.context.slot >= min_context_slot,
+            "RPC account context slot",
+        )?;
+        Ok(ContextValue {
+            context: result.context,
+            value: result.value.map(WireAccount::decode).transpose()?,
+        })
     }
     pub async fn account<T: Decode>(&self, address: Pubkey, program: Pubkey) -> Result<Option<T>> {
         self.raw_account(address)
@@ -204,11 +266,33 @@ impl RpcClient {
         &self,
         addresses: &[Pubkey],
     ) -> Result<ContextValue<Vec<Option<RawAccount>>>> {
+        self.multiple_accounts_at(addresses, 0).await
+    }
+    pub async fn multiple_accounts_at(
+        &self,
+        addresses: &[Pubkey],
+        min_context_slot: u64,
+    ) -> Result<ContextValue<Vec<Option<RawAccount>>>> {
         ensure(
             !addresses.is_empty() && addresses.len() <= 100,
             "RPC account batch size",
         )?;
-        let result:ContextValue<Vec<Option<WireAccount>>>=self.call("getMultipleAccounts",json!([addresses.iter().map(ToString::to_string).collect::<Vec<_>>(),{"encoding":"base64","commitment":self.commitment}])).await?;
+        let result: ContextValue<Vec<Option<WireAccount>>> = self
+            .call(
+                "getMultipleAccounts",
+                json!([
+                    addresses
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
+                    self.read_options(min_context_slot)
+                ]),
+            )
+            .await?;
+        ensure(
+            result.context.slot >= min_context_slot,
+            "RPC account context slot",
+        )?;
         ensure(
             result.value.len() == addresses.len(),
             "RPC account batch response",
@@ -219,6 +303,34 @@ impl RpcClient {
                 .value
                 .into_iter()
                 .map(|a| a.map(WireAccount::decode).transpose())
+                .collect::<Result<_>>()?,
+        })
+    }
+    fn read_options(&self, min_context_slot: u64) -> Value {
+        let mut options = json!({"encoding":"base64","commitment":self.commitment});
+        if min_context_slot > 0 {
+            options["minContextSlot"] = json!(min_context_slot);
+        }
+        options
+    }
+    pub async fn program_snapshot(
+        &self,
+        program: Pubkey,
+        filters: Vec<Value>,
+    ) -> Result<ContextValue<Vec<(Pubkey, RawAccount)>>> {
+        #[derive(Deserialize)]
+        struct Entry {
+            #[serde(with = "crate::serde_pubkey")]
+            pubkey: Pubkey,
+            account: WireAccount,
+        }
+        let result: ContextValue<Vec<Entry>> = self.call("getProgramAccounts", json!([program.to_string(), {"encoding":"base64","commitment":self.commitment,"withContext":true,"filters":filters}])).await?;
+        Ok(ContextValue {
+            context: result.context,
+            value: result
+                .value
+                .into_iter()
+                .map(|e| Ok((e.pubkey, e.account.decode()?)))
                 .collect::<Result<_>>()?,
         })
     }
@@ -317,6 +429,19 @@ impl RpcClient {
         instructions: &[Instruction],
         payer: Pubkey,
     ) -> Result<PreparedTransaction> {
+        let latest = self.latest_blockhash().await?;
+        PreparedTransaction::new(
+            instructions,
+            payer,
+            latest.blockhash,
+            latest.last_valid_block_height,
+            latest.min_context_slot,
+        )
+    }
+    pub async fn latest_blockhash(&self) -> Result<LatestBlockhash> {
+        self.latest_blockhash_at(0).await
+    }
+    async fn latest_blockhash_at(&self, min_context_slot: u64) -> Result<LatestBlockhash> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Blockhash {
@@ -326,16 +451,48 @@ impl RpcClient {
         let result: ContextValue<Blockhash> = self
             .call(
                 "getLatestBlockhash",
-                json!([{"commitment":self.commitment}]),
+                json!([{"commitment":self.commitment,"minContextSlot":min_context_slot}]),
             )
             .await?;
+        Ok(LatestBlockhash {
+            blockhash: Hash::from_str(&result.value.blockhash)
+                .map_err(|_| Error::Invalid("RPC blockhash"))?,
+            last_valid_block_height: result.value.last_valid_block_height,
+            min_context_slot: result.context.slot,
+        })
+    }
+    // opt-in short reuse; clones share refreshes, with separate caches for each commitment.
+    pub async fn prepare_cached(
+        &self,
+        instructions: &[Instruction],
+        payer: Pubkey,
+        min_context_slot: u64,
+    ) -> Result<PreparedTransaction> {
+        let mut cached = self.blockhash[self.commitment as usize].lock().await;
+        let fresh = cached.as_ref().is_some_and(|(at, latest)| {
+            at.elapsed() < Duration::from_secs(5) && latest.min_context_slot >= min_context_slot
+        });
+        if !fresh {
+            let started = tokio::time::Instant::now();
+            let latest = self.latest_blockhash_at(min_context_slot).await?;
+            ensure(
+                latest.min_context_slot >= min_context_slot,
+                "RPC blockhash context slot",
+            )?;
+            *cached = Some((started, latest));
+        }
+        let latest = cached.as_ref().unwrap().1.clone();
+        drop(cached);
         PreparedTransaction::new(
             instructions,
             payer,
-            Hash::from_str(&result.value.blockhash).map_err(|_| Error::Invalid("RPC blockhash"))?,
-            result.value.last_valid_block_height,
-            result.context.slot,
+            latest.blockhash,
+            latest.last_valid_block_height,
+            latest.min_context_slot,
         )
+    }
+    pub async fn invalidate_blockhash(&self) {
+        *self.blockhash[self.commitment as usize].lock().await = None;
     }
     pub async fn simulate(&self, pending: &PendingTransaction) -> Result<Simulation> {
         pending.validate()?;
@@ -343,14 +500,31 @@ impl RpcClient {
         Ok(response.value)
     }
     pub async fn signature_status(&self, signature: &Signature) -> Result<Option<SignatureStatus>> {
+        Ok(self
+            .signature_statuses(std::slice::from_ref(signature), true)
+            .await?
+            .remove(0))
+    }
+    pub async fn signature_statuses(
+        &self,
+        signatures: &[Signature],
+        search_history: bool,
+    ) -> Result<Vec<Option<SignatureStatus>>> {
+        ensure(
+            !signatures.is_empty() && signatures.len() <= 256,
+            "signature batch size",
+        )?;
         let response: ContextValue<Vec<Option<SignatureStatus>>> = self
             .call(
                 "getSignatureStatuses",
-                json!([[signature.to_string()],{"searchTransactionHistory":true}]),
+                json!([signatures.iter().map(ToString::to_string).collect::<Vec<_>>(),{"searchTransactionHistory":search_history}]),
             )
             .await?;
-        ensure(response.value.len() == 1, "signature status count")?;
-        Ok(response.value.into_iter().next().flatten())
+        ensure(
+            response.value.len() == signatures.len(),
+            "signature status count",
+        )?;
+        Ok(response.value)
     }
     pub async fn submit(&self, pending: &PendingTransaction) -> Result<Signature> {
         let signature = pending.validate()?;
@@ -365,8 +539,22 @@ impl RpcClient {
         self.broadcast(pending).await
     }
     pub async fn broadcast(&self, pending: &PendingTransaction) -> Result<Signature> {
+        self.broadcast_with_options(
+            pending,
+            SendOptions {
+                preflight_commitment: self.commitment,
+                ..SendOptions::default()
+            },
+        )
+        .await
+    }
+    pub async fn broadcast_with_options(
+        &self,
+        pending: &PendingTransaction,
+        options: SendOptions,
+    ) -> Result<Signature> {
         let signature = pending.validate()?;
-        let result:String=self.call("sendTransaction",json!([pending.wire_base64,{"encoding":"base64","skipPreflight":false,"preflightCommitment":self.commitment,"maxRetries":3,"minContextSlot":pending.min_context_slot}])).await?;
+        let result:String=self.call("sendTransaction",json!([pending.wire_base64,{"encoding":"base64","skipPreflight":options.skip_preflight,"preflightCommitment":options.preflight_commitment,"maxRetries":options.max_retries,"minContextSlot":pending.min_context_slot}])).await?;
         ensure(
             result == signature.to_string(),
             "submitted transaction signature",
@@ -386,7 +574,9 @@ impl RpcClient {
                 next_height_check = tokio::time::Instant::now() + Duration::from_secs(5);
                 self.pending_status(pending, &signature).await?
             } else {
-                self.signature_status(&signature).await?
+                self.signature_statuses(std::slice::from_ref(&signature), false)
+                    .await?
+                    .remove(0)
             };
             if let Some(status) = status {
                 if let Some(err) = &status.err
@@ -402,7 +592,7 @@ impl RpcClient {
                 return Err(Error::Timeout);
             }
             tokio::time::sleep(
-                Duration::from_secs(1)
+                Duration::from_millis(250)
                     .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
             )
             .await;
@@ -420,6 +610,7 @@ impl RpcClient {
                 .await?
                 > pending.last_valid_block_height
         {
+            self.invalidate_blockhash().await;
             return self
                 .signature_status(signature)
                 .await?

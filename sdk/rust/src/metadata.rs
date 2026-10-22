@@ -119,9 +119,10 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 }
 pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write;
-        write!(&mut s, "{b:02x}").unwrap();
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    for &b in bytes {
+        s.push(DIGITS[usize::from(b >> 4)] as char);
+        s.push(DIGITS[usize::from(b & 15)] as char);
     }
     s
 }

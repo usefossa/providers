@@ -13,6 +13,16 @@ use std::{
 use zeroize::Zeroizing;
 
 pub const MAX_TRANSACTION_BYTES: usize = 1232;
+pub fn compute_unit_limit(units: u32) -> Instruction {
+    let mut data = Vec::with_capacity(5);
+    data.push(2);
+    data.extend(units.to_le_bytes());
+    Instruction {
+        program_id: Pubkey::from_str_const("ComputeBudget111111111111111111111111111111"),
+        accounts: vec![],
+        data,
+    }
+}
 pub struct PreparedTransaction {
     pub transaction: Transaction,
     pub last_valid_block_height: u64,
@@ -132,6 +142,7 @@ impl PendingTransaction {
         last_valid_block_height: u64,
         min_context_slot: u64,
     ) -> Result<Self> {
+        validate_message(transaction)?;
         transaction
             .verify()
             .map_err(|_| Error::Invalid("transaction signatures"))?;
@@ -148,7 +159,6 @@ impl PendingTransaction {
             last_valid_block_height,
             min_context_slot,
         };
-        pending.validate()?;
         Ok(pending)
     }
     pub fn transaction(&self) -> Result<Transaction> {
@@ -171,27 +181,7 @@ impl PendingTransaction {
                 == bytes,
             "canonical transaction bytes",
         )?;
-        let m = &transaction.message;
-        let required = usize::from(m.header.num_required_signatures);
-        ensure(
-            required > 0
-                && required == transaction.signatures.len()
-                && required <= m.account_keys.len()
-                && usize::from(m.header.num_readonly_signed_accounts) < required
-                && usize::from(m.header.num_readonly_unsigned_accounts)
-                    <= m.account_keys.len() - required,
-            "transaction message header",
-        )?;
-        ensure(
-            m.instructions.iter().all(|ix| {
-                usize::from(ix.program_id_index) < m.account_keys.len()
-                    && ix
-                        .accounts
-                        .iter()
-                        .all(|a| usize::from(*a) < m.account_keys.len())
-            }),
-            "transaction account indexes",
-        )?;
+        validate_message(&transaction)?;
         transaction
             .verify()
             .map_err(|_| Error::Invalid("transaction signatures"))?;
@@ -259,4 +249,29 @@ pub fn read_keypair(path: impl AsRef<Path>) -> Result<Keypair> {
     ensure(bytes.len() <= 4096, "keypair file size")?;
     let values: Zeroizing<Vec<u8>> = Zeroizing::new(serde_json::from_slice(&bytes)?);
     Keypair::try_from(values.as_slice()).map_err(|_| Error::Invalid("64-byte Solana keypair"))
+}
+
+fn validate_message(transaction: &Transaction) -> Result<()> {
+    let m = &transaction.message;
+    let required = usize::from(m.header.num_required_signatures);
+    ensure(
+        required > 0
+            && required == transaction.signatures.len()
+            && required <= m.account_keys.len()
+            && usize::from(m.header.num_readonly_signed_accounts) < required
+            && usize::from(m.header.num_readonly_unsigned_accounts)
+                <= m.account_keys.len() - required,
+        "transaction message header",
+    )?;
+    ensure(
+        m.instructions.iter().all(|ix| {
+            usize::from(ix.program_id_index) < m.account_keys.len()
+                && ix
+                    .accounts
+                    .iter()
+                    .all(|a| usize::from(*a) < m.account_keys.len())
+        }),
+        "transaction account indexes",
+    )?;
+    Ok(())
 }

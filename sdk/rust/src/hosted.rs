@@ -22,6 +22,8 @@ pub fn http_client() -> Result<reqwest::Client> {
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10))
         .pool_idle_timeout(Duration::from_secs(90))
+        .tcp_nodelay(true)
+        .tcp_keepalive(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .build()?)
 }
@@ -33,7 +35,8 @@ pub(crate) async fn response_bytes(mut response: reqwest::Response, max: usize) 
         response.content_length().is_none_or(|n| n <= max as u64),
         "HTTP response size",
     )?;
-    let mut bytes = Vec::new();
+    let mut bytes =
+        Vec::with_capacity(response.content_length().unwrap_or(0).min(max as u64) as usize);
     while let Some(chunk) = response.chunk().await? {
         ensure(bytes.len() + chunk.len() <= max, "HTTP response size")?;
         bytes.extend(chunk);

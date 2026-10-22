@@ -1,9 +1,25 @@
 use fossa_sdk::{
     Instruction, Keypair, Protocol, Pubkey, Result, RpcClient, Signer,
+    accounts::Booking,
     hosted::{HostedClient, PublicConfig},
+    inference::{RequestVerifier, VerifiedAuthorization},
     metadata::{Document, Kind},
 };
 use std::sync::Arc;
+
+// reuse the verifier and streamed account cache; persist replay admission before inference.
+pub fn authorize_cached(
+    verifier: &RequestVerifier,
+    headers: &reqwest::header::HeaderMap,
+    body: &[u8],
+    address: Pubkey,
+    booking: &Booking,
+    now: i64,
+) -> Result<VerifiedAuthorization> {
+    let verified = verifier.verify(headers, body)?;
+    verified.verify_booking(address, booking, now)?;
+    Ok(verified)
+}
 
 pub fn profile_update(
     protocol: &Protocol,
@@ -28,12 +44,11 @@ pub async fn hosted_profile_update(
 }
 
 pub async fn prepare_and_save(
-    rpc_url: &str,
+    rpc: &RpcClient,
     signer: &Keypair,
     instruction: Instruction,
     path: &std::path::Path,
 ) -> Result<()> {
-    let rpc = RpcClient::new(rpc_url)?;
     let pending = rpc
         .prepare(&[instruction], signer.pubkey())
         .await?

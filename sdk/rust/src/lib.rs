@@ -9,6 +9,7 @@ pub mod onboarding;
 pub mod receipt;
 pub mod rpc;
 pub mod transaction;
+pub use fossa_metadata as schema;
 
 pub use solana_address::Address as Pubkey;
 pub use solana_hash::Hash;
