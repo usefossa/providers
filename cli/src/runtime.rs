@@ -36,11 +36,13 @@ pub fn hosted(config: &Config) -> Result<HostedClient> {
 }
 pub fn rpc(config: &Config) -> Result<RpcClient> {
     if config.hosted_rpc {
-        Ok(RpcClient::hosted(hosted(config)?))
+        Ok(RpcClient::hosted(hosted(config)?)
+            .with_commitment(fossa_sdk::rpc::Commitment::Confirmed))
     } else {
-        Ok(RpcClient::new(config.rpc_url.as_deref().ok_or_else(
-            || Error::Input("RPC disabled; set --rpc-url URL or enable --hosted-rpc".into()),
-        )?)?)
+        Ok(RpcClient::new(config.rpc_url.as_deref().ok_or_else(|| {
+            Error::Input("RPC disabled; set --rpc-url URL or enable --hosted-rpc".into())
+        })?)?
+        .with_commitment(fossa_sdk::rpc::Commitment::Confirmed))
     }
 }
 pub struct Runtime {

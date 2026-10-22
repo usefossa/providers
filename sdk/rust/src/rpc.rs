@@ -21,8 +21,8 @@ use std::{
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Commitment {
-    Processed,
     #[default]
+    Processed,
     Confirmed,
     Finalized,
 }
@@ -74,7 +74,7 @@ impl Default for SendOptions {
     fn default() -> Self {
         Self {
             skip_preflight: false,
-            preflight_commitment: Commitment::Confirmed,
+            preflight_commitment: Commitment::default(),
             max_retries: 3,
         }
     }
@@ -167,7 +167,7 @@ impl RpcClient {
         )?;
         Ok(Self {
             transport: Transport::Own { http, url },
-            commitment: Commitment::Confirmed,
+            commitment: Commitment::default(),
             ids: Arc::new(AtomicU64::new(1)),
             blockhash: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(None))),
         })
@@ -175,7 +175,7 @@ impl RpcClient {
     pub fn hosted(client: HostedClient) -> Self {
         Self {
             transport: Transport::Hosted(client),
-            commitment: Commitment::Confirmed,
+            commitment: Commitment::default(),
             ids: Arc::new(AtomicU64::new(1)),
             blockhash: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(None))),
         }
@@ -620,7 +620,12 @@ impl RpcClient {
         Ok(status)
     }
     pub async fn transaction(&self, signature: &Signature) -> Result<Option<Value>> {
-        self.call("getTransaction",json!([signature.to_string(),{"encoding":"json","commitment":self.commitment,"maxSupportedTransactionVersion":0}])).await
+        let commitment = if self.commitment == Commitment::Processed {
+            Commitment::Confirmed
+        } else {
+            self.commitment
+        };
+        self.call("getTransaction",json!([signature.to_string(),{"encoding":"json","commitment":commitment,"maxSupportedTransactionVersion":0}])).await
     }
     pub async fn create_model_books(
         &self,

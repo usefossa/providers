@@ -585,7 +585,11 @@ async fn provider_reads_preserve_commitment_context_and_null_results() {
         rpc_response(body, result)
     }).await;
     let rpc = RpcClient::new(&mock.url).unwrap();
-    assert_eq!(rpc.commitment(), Commitment::Confirmed);
+    assert_eq!(rpc.commitment(), Commitment::Processed);
+    assert_eq!(
+        fossa_sdk::rpc::SendOptions::default().preflight_commitment,
+        Commitment::Processed
+    );
     let read = rpc
         .clone()
         .with_commitment(Commitment::Processed)
@@ -594,6 +598,7 @@ async fn provider_reads_preserve_commitment_context_and_null_results() {
         .unwrap();
     assert_eq!(read.context.slot, 10);
     assert!(read.value.is_none());
+    let rpc = rpc.with_commitment(Commitment::Confirmed);
     assert!(rpc.multiple_accounts_at(&[key(1)], 10).await.is_err());
     let snapshot = rpc.program_snapshot(key(1), vec![]).await.unwrap();
     assert_eq!(snapshot.context.slot, 12);
@@ -646,7 +651,7 @@ async fn blockhash_reuse_coalesces_refreshes_and_respects_slots_age_and_commitme
     );
     assert_eq!(calls.load(Ordering::Relaxed), 2);
     rpc.clone()
-        .with_commitment(Commitment::Processed)
+        .with_commitment(Commitment::Confirmed)
         .prepare_cached(&instructions, key(7), 0)
         .await
         .unwrap();
@@ -755,4 +760,38 @@ fn cached_verifier_keeps_strict_signature_checks_for_every_request() {
     auth.owner = Pubkey::new_from_array(weak_key);
     auth.signature = Signature::from(weak_signature);
     assert!(verifier.verify(&auth.headers().unwrap(), body).is_err());
+}
+
+#[tokio::test]
+async fn processed_default_keeps_confirmed_opt_in_and_supported_history_commitment() {
+    use fossa_sdk::rpc::Commitment;
+    let mock = spawn_mock(|_, _, body| {
+        let q: Value = serde_json::from_slice(body).unwrap();
+        let result = match q["method"].as_str().unwrap() {
+            "getSignatureStatuses" => json!({"context":{"slot":1},"value":[{"slot":1,"confirmations":0,"err":null,"confirmationStatus":"processed"}]}),
+            "getTransaction" => { assert_eq!(q["params"][1]["commitment"], "confirmed"); Value::Null },
+            _ => panic!("unexpected method"),
+        };
+        rpc_response(body, result)
+    }).await;
+    let rpc = RpcClient::new(&mock.url).unwrap();
+    assert_eq!(
+        rpc.confirm(&pending(), Duration::ZERO)
+            .await
+            .unwrap()
+            .confirmation_status,
+        Some(Commitment::Processed)
+    );
+    assert!(
+        rpc.transaction(&Signature::default())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        rpc.with_commitment(Commitment::Confirmed)
+            .confirm(&pending(), Duration::ZERO)
+            .await,
+        Err(Error::Timeout)
+    ));
 }
