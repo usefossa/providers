@@ -1,0 +1,123 @@
+name: verify and release
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: providers-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  RUST_VERSION: '1.99.0'
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: select compiler
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt,clippy
+          rustup override set "$RUST_VERSION"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-on-failure: 'true'
+      - name: verify
+        run: |
+          cargo fmt --all --check
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+  build:
+    if: startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: select compiler
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target "$TARGET"
+          rustup override set "$RUST_VERSION"
+      - name: install linux linker
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends musl-tools
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ${{ matrix.target }}
+          cache-on-failure: 'true'
+      - name: test, build and smoke test
+        env:
+          TARGET: ${{ matrix.target }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ "$TARGET" == *linux-musl ]]; then
+            export CC=musl-gcc
+            export RUSTFLAGS='-C linker=musl-gcc'
+          fi
+          cargo test --workspace --locked --target "$TARGET"
+          cargo build --release --locked -p fossa-provider --target "$TARGET"
+          binary="target/$TARGET/release/fossa-provider"
+          test "$("$binary" --version)" = "fossa-provider ${RELEASE_TAG#v}"
+          "$binary" --help >/dev/null
+          mkdir dist
+          cp "$binary" "dist/fossa-provider-$TARGET"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: fossa-provider-${{ matrix.target }}
+          path: dist/fossa-provider-${{ matrix.target }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+  release:
+    needs: [verify, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: fossa-provider-*
+          merge-multiple: true
+          path: dist
+      - name: manifest and private release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          node --input-type=module <<'JS'
+          import { createHash } from 'node:crypto';
+          import { readFileSync, writeFileSync } from 'node:fs';
+          const targets = {};
+          for (const target of ['x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl', 'x86_64-apple-darwin', 'aarch64-apple-darwin']) {
+            const bytes = readFileSync(`dist/fossa-provider-${target}`);
+            targets[target] = { sha256: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length };
+          }
+          const version = process.env.RELEASE_TAG.slice(1);
+          if (!/^\d+\.\d+\.\d+$/.test(version)) throw Error('invalid release version');
+          writeFileSync('dist/manifest.json', JSON.stringify({ version, targets }, null, 2) + '\n');
+          JS
+          gh release create "$RELEASE_TAG" dist/* --verify-tag --title "$RELEASE_TAG" --notes 'provider sdk, cli and metadata schema'

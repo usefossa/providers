@@ -3,7 +3,7 @@ import { dirname, resolve } from "node:path";
 
 const files = ["Cargo.toml", "schema.json", "fixtures.json", "src/lib.rs"];
 const args = process.argv.slice(2), write = args[0] === "--write";
-if (!["--write", "--check"].includes(args.shift() ?? "") || !args.length || args.length % 2) throw Error("Usage: bun metadata/sync.ts --check|--write --backend PATH --stealth PATH --frontend PATH");
+if (!["--write", "--check"].includes(args.shift() ?? "") || !args.length || args.length % 2) throw Error("Usage: bun schema/sync.ts --check|--write --backend PATH --stealth PATH --frontend PATH");
 for (let index = 0; index < args.length; index += 2) {
   const kind = args[index]!, root = resolve(args[index + 1]!);
   if (!["--backend", "--stealth", "--frontend"].includes(kind)) throw Error(`Unknown target ${kind}`);

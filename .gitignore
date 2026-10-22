@@ -5,6 +5,9 @@ node_modules/
 .local/
 **/.local/
 config.toml
+provider.toml
+*keypair*.json
+**/transactions/
 .env*
 !.env.example
 *.sqlite*

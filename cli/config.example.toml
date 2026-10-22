@@ -1,36 +1,47 @@
-# pass --config <path> or set FOSSA_CONFIG; paths below are relative to this file.
-# commands only inspect/plan unless --execute is supplied.
-# publish metadata files unchanged at their configured urls before execution.
+# explicit config: --config /path/provider.toml or FOSSA_CONFIG.
+# config paths resolve relative to this file. keep config and keys outside git.
+# commands plan by default; --execute authorizes uploads/signing/broadcast.
+journal_dir = "transactions"
 
 [solana]
 rpc_url = "https://rpc.example.com"
-usdc_mint = "REPLACE_WITH_PAYMENT_MINT"
+# omit all three protocol addresses to read public /v1/config.
+# usdc_mint = "REPLACE_WITH_PAYMENT_MINT"
 
-[marketplace]
-program_id = "REPLACE_WITH_PROGRAM_PUBLIC_KEY"
-market = "REPLACE_WITH_MARKET_PUBLIC_KEY"
+# [marketplace]
+# program_id = "REPLACE_WITH_PROGRAM_PUBLIC_KEY"
+# market = "REPLACE_WITH_MARKET_PUBLIC_KEY"
+
+[hosted]
+api_url = "https://api.fossa.ag"
+# optional signed fossa rpc: remove solana.rpc_url and set rpc = true.
+# hosted rpc signs request authentication even for read-only commands.
+rpc = false
 
 [operator]
-# standard solana-keygen json files; keep outside git.
-# provider signer for onboarding.
-keypair = "../.local/provider-keypair.json"
-# optional separate fee payer and market admin for onboarding.
-# payer = "../.local/payer-keypair.json"
-# admin = "../.local/admin-keypair.json"
+keypair = "provider-keypair.json"
+# payer = "payer-keypair.json"
 
 [provider]
-wallet = "REPLACE_WITH_PROVIDER_PUBLIC_KEY"
-metadata_file = "../.local/provider.json"
-metadata_uri = "https://provider.example.com/provider.json"
+# optional with keypair; required for key-free planning/inspection.
+# wallet = "REPLACE_WITH_PROVIDER_PUBLIC_KEY"
+metadata_file = "provider.json"
+# metadata_uri = "https://provider.example.com/immutable/provider.json"
+# omit uri for immutable fossa hosting on --execute.
 speed_tps = 100
 capacity = 4
+private = false
+active = true
 model_book_limit = 16
 bond_target_atomic = "1000000"
 
 [[provider.models]]
 id = "example/model"
-metadata_file = "../.local/model.json"
-metadata_uri = "https://provider.example.com/model.json"
+metadata_file = "model.json"
+# metadata_uri = "https://provider.example.com/immutable/model.json"
+# rates below: micro-usdc per million tokens; 1000000 means $1.00/million.
 input_rate = 1000000
 cached_rate = 500000
 output_rate = 2000000
+# optional per-model overrides: speed_tps, capacity, private, active,
+# bond_target_atomic and slot. omitted fields inherit provider defaults.
