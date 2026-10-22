@@ -1,0 +1,13 @@
+target/
+**/target/
+node_modules/
+**/node_modules/
+.local/
+**/.local/
+config.toml
+.env*
+!.env.example
+*.sqlite*
+*.key
+*.pem
+*.log
