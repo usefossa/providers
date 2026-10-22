@@ -10,7 +10,7 @@ install cli:
 
 ```bash
 curl -fsSL https://api.fossa.ag/v1/providers/install.sh | bash
-fossa-provider --help
+fossa --help
 ```
 
 check locally:

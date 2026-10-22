@@ -1,7 +1,14 @@
 use crate::{Error, Result, args::Options};
-use fossa_sdk::{Protocol, Pubkey, hosted::PublicConfig};
+use fossa_sdk::{Protocol, Pubkey};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+
+pub const API_URL: &str = "https://api.fossa.ag";
+pub const PROGRAM_ID: Pubkey =
+    Pubkey::from_str_const("F8q85nw6UScZCBKBJqVAu7ZdYhmT9XRsm6TqZzJqXSNT");
+pub const MARKET: Pubkey = Pubkey::from_str_const("8wceBTFDAiC9WiT3xZGRf9Nf4xrz8eBCxExBtDWz1Som");
+pub const USDC_MINT: Pubkey =
+    Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -38,7 +45,7 @@ pub struct Operator {
 #[serde(default, deny_unknown_fields)]
 pub struct Hosted {
     pub api_url: Option<String>,
-    pub rpc: bool,
+    pub rpc: Option<bool>,
 }
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -80,9 +87,9 @@ pub struct Config {
     pub keypair: Option<PathBuf>,
     pub payer: Option<PathBuf>,
     pub wallet: Option<Pubkey>,
-    pub program_id: Option<Pubkey>,
-    pub market: Option<Pubkey>,
-    pub mint: Option<Pubkey>,
+    pub program_id: Pubkey,
+    pub market: Pubkey,
+    pub mint: Pubkey,
     pub journal: PathBuf,
 }
 impl Config {
@@ -104,15 +111,17 @@ impl Config {
         Self::resolve(options, file, base, &cwd)
     }
     pub fn resolve(o: &Options, file: FileConfig, base: PathBuf, cwd: &Path) -> Result<Self> {
-        let hosted_rpc = if o.rpc_url.is_some() {
-            false
-        } else {
-            o.hosted_rpc.unwrap_or(file.hosted.rpc)
-        };
         let rpc_url = if o.hosted_rpc == Some(true) {
             None
         } else {
             o.rpc_url.clone().or_else(|| file.solana.rpc_url.clone())
+        };
+        let hosted_rpc = if o.rpc_url.is_some() {
+            false
+        } else {
+            o.hosted_rpc
+                .or(file.hosted.rpc)
+                .unwrap_or(rpc_url.is_none())
         };
         if hosted_rpc && rpc_url.is_some() {
             return Err(Error::Input(
@@ -140,7 +149,7 @@ impl Config {
                 &o.api_url
                     .clone()
                     .or_else(|| file.hosted.api_url.clone())
-                    .unwrap_or_else(|| "https://api.fossa.ag".into()),
+                    .unwrap_or_else(|| API_URL.into()),
             )?,
             rpc_url,
             hosted_rpc,
@@ -148,18 +157,21 @@ impl Config {
             payer,
             journal,
             wallet: o.wallet.or(file.provider.wallet),
-            program_id: o.program_id.or(file.marketplace.program_id),
-            market: o.market.or(file.marketplace.market),
-            mint: o.usdc_mint.or(file.solana.usdc_mint),
+            program_id: o
+                .program_id
+                .or(file.marketplace.program_id)
+                .unwrap_or(PROGRAM_ID),
+            market: o.market.or(file.marketplace.market).unwrap_or(MARKET),
+            mint: o.usdc_mint.or(file.solana.usdc_mint).unwrap_or(USDC_MINT),
             file,
             base,
         })
     }
-    pub async fn protocol(&self) -> Result<Protocol> {
-        match (self.program_id, self.market, self.mint) {
-            (Some(program),Some(market),Some(mint)) => Ok(Protocol { program,market,mint }),
-            (None,None,None) => Ok(PublicConfig::fetch(&self.api_url).await?.protocol()),
-            _ => Err(Error::Input("supply program_id, market and usdc_mint together; omit all three to use public /v1/config".into())),
+    pub fn protocol(&self) -> Protocol {
+        Protocol {
+            program: self.program_id,
+            market: self.market,
+            mint: self.mint,
         }
     }
 }
@@ -193,7 +205,7 @@ mod tests {
         assert_eq!(config.keypair, Some(PathBuf::from("/cwd/override.json")));
         assert_eq!(config.journal, PathBuf::from("/config/transactions"));
         assert_eq!(config.wallet, Some(key));
-        assert_eq!(config.program_id, Some(key));
+        assert_eq!(config.program_id, key);
     }
     #[test]
     fn own_rpc_override_disables_configured_hosted_rpc() {

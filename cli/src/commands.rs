@@ -28,7 +28,7 @@ pub async fn run(cli: Cli) -> Result<Value> {
     match &cli.command {
         Command::Config(ConfigCommand::Show) => {
             return Ok(
-                json!({"api_url":config.api_url,"rpc":if config.hosted_rpc { "hosted" } else if config.rpc_url.is_some() { "custom (URL redacted)" } else { "unconfigured" },"wallet":config.wallet.map(|w|w.to_string()),"keypair_configured":config.keypair.is_some(),"separate_payer":config.payer.is_some(),"journal_dir":config.journal,"program_id":config.program_id.map(|p|p.to_string()),"market":config.market.map(|p|p.to_string()),"usdc_mint":config.mint.map(|p|p.to_string()),"mode":if cli.options.execute {"execute"} else {"plan"}}),
+                json!({"api_url":config.api_url,"rpc":if config.hosted_rpc { "hosted" } else if config.rpc_url.is_some() { "custom (URL redacted)" } else { "disabled" },"wallet":config.wallet.map(|w|w.to_string()),"keypair_configured":config.keypair.is_some(),"separate_payer":config.payer.is_some(),"journal_dir":config.journal,"program_id":config.program_id.to_string(),"market":config.market.to_string(),"usdc_mint":config.mint.to_string(),"mode":if cli.options.execute {"execute"} else {"plan"}}),
             );
         }
         Command::Metadata(MetadataCommand::Upload { kind, file }) => {

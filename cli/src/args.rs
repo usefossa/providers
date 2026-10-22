@@ -5,7 +5,7 @@ use std::path::PathBuf;
 pub const DOCS: &str = "docs: https://fossa.ag/docs/providers/cli.md\nsdk: https://fossa.ag/docs/providers/sdk.md\nstart: https://fossa.ag/docs/providers/quick-start.md";
 
 #[derive(Parser, Debug)]
-#[command(name = "fossa-provider", version, about = "Inspect and manage Fossa providers; mutations plan until --execute", after_help = DOCS)]
+#[command(name = "fossa", version, styles = help_styles(), about = "Inspect and manage Fossa providers; mutations plan until --execute", after_help = DOCS)]
 pub struct Cli {
     #[command(flatten)]
     pub options: Options,
@@ -14,13 +14,16 @@ pub struct Cli {
 }
 #[derive(Args, Debug, Default)]
 pub struct Options {
+    /// Force compact JSON output and structured errors, including in terminals
+    #[arg(long, global = true)]
+    pub json: bool,
     /// Explicit TOML config; file paths inside resolve relative to its directory
     #[arg(long, global = true, env = "FOSSA_CONFIG", hide_env_values = true)]
     pub config: Option<PathBuf>,
     /// Own Solana RPC URL; never included in output
     #[arg(long, global = true, env = "FOSSA_RPC_URL", hide_env_values = true)]
     pub rpc_url: Option<String>,
-    /// Use Fossa RPC; read requests sign authentication messages, never transactions
+    /// Fossa RPC defaults on without a custom RPC; reads sign authentication messages
     #[arg(
         long,
         global = true,
@@ -31,7 +34,7 @@ pub struct Options {
         require_equals = true,
     )]
     pub hosted_rpc: Option<bool>,
-    /// Fossa API origin for public config and optional hosting
+    /// Fossa API origin (default https://api.fossa.ag)
     #[arg(long, global = true, env = "FOSSA_API_URL", hide_env_values = true)]
     pub api_url: Option<String>,
     /// Standard Solana JSON keypair outside git
@@ -43,10 +46,13 @@ pub struct Options {
     /// Optional separate fee payer keypair
     #[arg(long, global = true, env = "FOSSA_PAYER", hide_env_values = true)]
     pub payer: Option<PathBuf>,
+    /// Override the default Fossa program address
     #[arg(long, global = true, env = "FOSSA_PROGRAM_ID", hide_env_values = true)]
     pub program_id: Option<Pubkey>,
+    /// Override the default market address
     #[arg(long, global = true, env = "FOSSA_MARKET", hide_env_values = true)]
     pub market: Option<Pubkey>,
+    /// Override the default USDC mint
     #[arg(long, global = true, env = "FOSSA_USDC_MINT", hide_env_values = true)]
     pub usdc_mint: Option<Pubkey>,
     /// Authorize this command's uploads, transaction signing and broadcast
@@ -441,10 +447,24 @@ pub fn parse_positive_rate(value: &str) -> Result<u32, String> {
     }
 }
 
+pub fn help_styles() -> clap::builder::Styles {
+    use clap::builder::styling::AnsiColor;
+    clap::builder::Styles::styled()
+        .header(AnsiColor::Cyan.on_default().bold())
+        .usage(AnsiColor::Cyan.on_default().bold())
+        .literal(AnsiColor::Green.on_default().bold())
+        .placeholder(AnsiColor::Yellow.on_default())
+        .error(AnsiColor::Red.on_default().bold())
+        .valid(AnsiColor::Green.on_default())
+        .invalid(AnsiColor::Red.on_default())
+}
+
 impl Cli {
     pub fn parse_options() -> Result<Self, clap::Error> {
         use clap::{CommandFactory, FromArgMatches, parser::ValueSource};
-        let matches = Self::command().try_get_matches()?;
+        let matches = Self::command()
+            .color(crate::output::help_color())
+            .try_get_matches()?;
         let mut cli = Self::from_arg_matches(&matches)?;
         if cli.options.hosted_rpc == Some(true) && cli.options.rpc_url.is_some() {
             match (
@@ -458,10 +478,19 @@ impl Cli {
                     cli.options.rpc_url = None
                 }
                 _ => {
-                    return Err(clap::Error::raw(
+                    let mut error = clap::Error::raw(
                         clap::error::ErrorKind::ArgumentConflict,
-                        "select one RPC transport: --rpc-url or --hosted-rpc",
-                    ));
+                        "select one RPC transport",
+                    );
+                    error.insert(
+                        clap::error::ContextKind::InvalidArg,
+                        clap::error::ContextValue::String("--rpc-url".into()),
+                    );
+                    error.insert(
+                        clap::error::ContextKind::PriorArg,
+                        clap::error::ContextValue::String("--hosted-rpc".into()),
+                    );
+                    return Err(error);
                 }
             }
         }
@@ -504,18 +533,11 @@ mod tests {
         }
         assert!(parse_positive_usdc("0").is_err());
         assert!(
-            Cli::try_parse_from([
-                "fossa-provider",
-                "offer",
-                "update",
-                "--model",
-                "example/model"
-            ])
-            .is_err()
+            Cli::try_parse_from(["fossa", "offer", "update", "--model", "example/model"]).is_err()
         );
         assert!(
             Cli::try_parse_from([
-                "fossa-provider",
+                "fossa",
                 "offer",
                 "update",
                 "--model",

@@ -78,8 +78,8 @@ jobs:
           fi
           cargo test --workspace --locked --target "$TARGET"
           cargo build --release --locked -p fossa-provider --target "$TARGET"
-          binary="target/$TARGET/release/fossa-provider"
-          test "$("$binary" --version)" = "fossa-provider ${RELEASE_TAG#v}"
+          binary="target/$TARGET/release/fossa"
+          test "$("$binary" --version)" = "fossa ${RELEASE_TAG#v}"
           "$binary" --help >/dev/null
           mkdir dist
           cp "$binary" "dist/fossa-provider-$TARGET"

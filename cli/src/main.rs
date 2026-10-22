@@ -1,9 +1,11 @@
 mod args;
 mod commands;
 mod config;
+mod output;
 mod runtime;
 
-use serde_json::json;
+use clap::CommandFactory;
+use std::io::Write;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -26,8 +28,16 @@ pub enum Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
+    if std::env::args_os().len() == 1 {
+        let _ = args::Cli::command()
+            .color(output::help_color())
+            .print_help();
+        let _ = writeln!(std::io::stdout());
+        return;
+    }
+    let mode = output::Output::detect(output::json_requested());
     let cli = match args::Cli::parse_options() {
         Ok(cli) => cli,
         Err(error) => {
@@ -35,49 +45,29 @@ async fn main() {
                 error.kind(),
                 clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
             ) {
-                print!("{error}");
+                let _ = error.print();
                 return;
             }
-            eprintln!(
-                "{}",
-                json!({"ok":false,"error":{"code":"arguments","message":"invalid arguments; run the command with --help","kind":format!("{:?}",error.kind()),"argument":if error.kind() == clap::error::ErrorKind::ValueValidation { error.get(clap::error::ContextKind::InvalidArg).map(ToString::to_string) } else { None },"docs":"https://fossa.ag/docs/providers/cli.md"}})
-            );
+            let _ = mode.error(&output::parse_error(&error));
             std::process::exit(2);
         }
     };
+    let mode = output::Output::detect(cli.options.json);
     match commands::run(cli).await {
-        Ok(value) => println!("{}", json!({"ok":true,"result":value})),
+        Ok(value) => {
+            let _ = mode.result(value);
+        }
         Err(error) => {
-            let code = match &error {
-                Error::Input(_) => "input",
-                Error::Pending { .. } => "pending_transaction",
-                Error::Io(_) => "io",
-                Error::Json(_) => "json",
-                Error::Sdk(_) => "sdk",
-            };
-            let recovery = match &error {
-                Error::Pending {
-                    signature, journal, ..
-                } => Some(json!({"signature":signature,"journal":journal})),
-                _ => None,
-            };
-            eprintln!(
-                "{}",
-                json!({"ok":false,"recovery":recovery,"error":{"code":code,"message":match &error { Error::Sdk(error) => sdk_message(error), _ => error.to_string() },"docs":"https://fossa.ag/docs/providers/cli.md"}})
-            );
+            let _ = mode.error(&output::runtime_error(&error));
             std::process::exit(1);
         }
     }
 }
-
 pub fn sdk_message(error: &fossa_sdk::Error) -> String {
     match error {
-        fossa_sdk::Error::Rpc { code, .. } => format!(
-            "RPC error {code}; remote message omitted to protect request credentials and signed bytes"
-        ),
-        fossa_sdk::Error::Transaction(_) => {
-            "transaction simulation or execution failed; signed bytes remain private".into()
-        }
-        _ => error.to_string(),
+        fossa_sdk::Error::Rpc{code,..}=>format!("RPC error {code}; check RPC availability and request permissions"),
+        fossa_sdk::Error::Transaction(_)=>"transaction simulation or execution failed; check account state and balances before retrying".into(),
+        fossa_sdk::Error::Json(error)=>format!("invalid server or keypair JSON at line {}, column {}",error.line(),error.column()),
+        _=>error.to_string(),
     }
 }

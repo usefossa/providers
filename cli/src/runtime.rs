@@ -29,6 +29,9 @@ pub fn wallet(config: &Config) -> Result<Pubkey> {
         .unwrap_or_else(|| keypair(config).map(|s| s.pubkey()))
 }
 pub fn hosted(config: &Config) -> Result<HostedClient> {
+    if config.keypair.is_none() {
+        return Err(Error::Input("hosted RPC and uploads require request authentication; set --keypair PATH or use --rpc-url URL for key-free reads".into()));
+    }
     Ok(HostedClient::new(&config.api_url, keypair(config)?)?)
 }
 pub fn rpc(config: &Config) -> Result<RpcClient> {
@@ -36,11 +39,7 @@ pub fn rpc(config: &Config) -> Result<RpcClient> {
         Ok(RpcClient::hosted(hosted(config)?))
     } else {
         Ok(RpcClient::new(config.rpc_url.as_deref().ok_or_else(
-            || {
-                Error::Input(
-                    "set --rpc-url/solana.rpc_url or explicitly select --hosted-rpc".into(),
-                )
-            },
+            || Error::Input("RPC disabled; set --rpc-url URL or enable --hosted-rpc".into()),
         )?)?)
     }
 }
@@ -53,7 +52,7 @@ pub struct Runtime {
 impl Runtime {
     pub async fn connect(config: Config, options: Options) -> Result<Self> {
         let rpc = rpc(&config)?;
-        let protocol = config.protocol().await?;
+        let protocol = config.protocol();
         rpc.validate_market(&protocol).await?;
         Ok(Self {
             config,

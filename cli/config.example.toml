@@ -1,29 +1,27 @@
 # explicit config: --config /path/provider.toml or FOSSA_CONFIG.
-# config paths resolve relative to this file. keep config and keys outside git.
+# config paths resolve beside this file. keep config, keys and journals outside git.
 # commands plan by default; --execute authorizes uploads/signing/broadcast.
 journal_dir = "transactions"
-
-[solana]
-rpc_url = "https://rpc.example.com"
-# omit all three protocol addresses to read public /v1/config.
-# usdc_mint = "REPLACE_WITH_PAYMENT_MINT"
-
-# [marketplace]
-# program_id = "REPLACE_WITH_PROGRAM_PUBLIC_KEY"
-# market = "REPLACE_WITH_MARKET_PUBLIC_KEY"
-
-[hosted]
-api_url = "https://api.fossa.ag"
-# optional signed fossa rpc: remove solana.rpc_url and set rpc = true.
-# hosted rpc signs request authentication even for read-only commands.
-rpc = false
 
 [operator]
 keypair = "provider-keypair.json"
 # payer = "payer-keypair.json"
 
+# hosted rpc defaults on without an own rpc url; reads sign authentication.
+# api and public protocol addresses are pinned locally, with no config fetch.
+# optional overrides:
+# [solana]
+# rpc_url = "https://rpc.example.com"
+# usdc_mint = "REPLACE_WITH_PAYMENT_MINT"
+# [marketplace]
+# program_id = "REPLACE_WITH_PROGRAM_PUBLIC_KEY"
+# market = "REPLACE_WITH_MARKET_PUBLIC_KEY"
+# [hosted]
+# api_url = "https://api.fossa.ag"
+# rpc = false
+
 [provider]
-# optional with keypair; required for key-free planning/inspection.
+# optional with keypair; required for key-free planning through own rpc.
 # wallet = "REPLACE_WITH_PROVIDER_PUBLIC_KEY"
 metadata_file = "provider.json"
 # metadata_uri = "https://provider.example.com/immutable/provider.json"

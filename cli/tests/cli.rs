@@ -84,7 +84,7 @@ fn mock(handler: impl Fn(&str, &Value) -> Value + Send + 'static) -> Mock {
     }
 }
 fn cmd(dir: &Path) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_fossa-provider"));
+    let mut c = Command::new(env!("CARGO_BIN_EXE_fossa"));
     c.env_clear().current_dir(dir);
     c
 }
@@ -143,7 +143,7 @@ fn version_and_offline_validation_need_no_config_network_or_keys() {
     let version = cmd(dir.path()).arg("--version").output().unwrap();
     assert_eq!(
         String::from_utf8(version.stdout).unwrap(),
-        format!("fossa-provider {}\n", env!("CARGO_PKG_VERSION"))
+        format!("fossa {}\n", env!("CARGO_PKG_VERSION"))
     );
     let raw = b"{ \"name\": \"Example\", \"endpoint\": \"https://example.com/infer\" }\n";
     std::fs::write(dir.path().join("provider.json"), raw).unwrap();
@@ -732,4 +732,239 @@ fn metadata_upload_is_exact_immutable_and_independent_of_rpc() {
     assert_eq!(value["upload"]["sha256"], sha);
     assert_eq!(value["upload"]["bytes"], bytes.len());
     assert!(!dir.path().join("transactions").exists());
+}
+
+#[test]
+fn no_arguments_show_help_successfully_and_json_flag_keeps_pipes_compact() {
+    let dir = tempfile::tempdir().unwrap();
+    let help = cmd(dir.path())
+        .env("FOSSA_CONFIG", "missing-help-secret.toml")
+        .env("FOSSA_KEYPAIR", "missing-help-secret.json")
+        .env("FOSSA_WALLET", "invalid-help-secret")
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    assert!(help.stderr.is_empty());
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.contains("Usage: fossa"));
+    assert!(help.contains("--json"));
+    assert!(!help.contains("fossa-provider"));
+    assert!(!help.contains("help-secret"));
+    assert!(!help.contains('\u{1b}'));
+    for flags in [vec!["config", "show"], vec!["--json", "config", "show"]] {
+        let output = cmd(dir.path()).args(flags).output().unwrap();
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(!text.contains('\u{1b}'));
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap()["result"]["rpc"],
+            "hosted"
+        );
+    }
+    let error = cmd(dir.path())
+        .args(["--json", "provider", "register"])
+        .output()
+        .unwrap();
+    assert!(!error.status.success());
+    assert!(error.stdout.is_empty());
+    let text = String::from_utf8(error.stderr).unwrap();
+    assert_eq!(text.lines().count(), 1);
+    assert!(text.contains("--metadata-file"));
+    assert!(!text.contains('\u{1b}'));
+    assert!(serde_json::from_str::<Value>(&text).unwrap()["error"]["hint"].is_string());
+}
+#[test]
+fn no_color_overrides_forced_help_colors_and_never_alters_json_data() {
+    let dir = tempfile::tempdir().unwrap();
+    for args in [vec!["--help"], vec!["provider", "update", "--help"]] {
+        let output = cmd(dir.path())
+            .env("NO_COLOR", "")
+            .env("CLICOLOR_FORCE", "1")
+            .env("TERM", "xterm-256color")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(!String::from_utf8(output.stdout).unwrap().contains('\u{1b}'));
+    }
+    let value = result(
+        cmd(dir.path())
+            .env("NO_COLOR", "1")
+            .args(["--json", "config", "show"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(value["api_url"], "https://api.fossa.ag");
+    assert_eq!(
+        value["program_id"],
+        "F8q85nw6UScZCBKBJqVAu7ZdYhmT9XRsm6TqZzJqXSNT"
+    );
+    assert_eq!(
+        value["market"],
+        "8wceBTFDAiC9WiT3xZGRf9Nf4xrz8eBCxExBtDWz1Som"
+    );
+    assert_eq!(
+        value["usdc_mint"],
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    );
+}
+#[test]
+fn default_transport_respects_file_env_flags_and_explicit_disable() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "[solana]\nrpc_url='https://own.example/?token=secret'\n",
+    )
+    .unwrap();
+    assert_eq!(
+        result(
+            cmd(dir.path())
+                .args(["--config", "config.toml", "config", "show"])
+                .output()
+                .unwrap()
+        )["rpc"],
+        "custom (URL redacted)"
+    );
+    assert_eq!(
+        result(
+            cmd(dir.path())
+                .args(["--config", "config.toml", "--hosted-rpc", "config", "show"])
+                .output()
+                .unwrap()
+        )["rpc"],
+        "hosted"
+    );
+    assert_eq!(
+        result(
+            cmd(dir.path())
+                .args(["--hosted-rpc=false", "config", "show"])
+                .output()
+                .unwrap()
+        )["rpc"],
+        "disabled"
+    );
+    std::fs::write(dir.path().join("config.toml"), "[hosted]\nrpc=true\n").unwrap();
+    assert_eq!(
+        result(
+            cmd(dir.path())
+                .env("FOSSA_HOSTED_RPC", "false")
+                .args(["--config", "config.toml", "config", "show"])
+                .output()
+                .unwrap()
+        )["rpc"],
+        "disabled"
+    );
+    std::fs::write(dir.path().join("config.toml"), "[hosted]\nrpc=false\n").unwrap();
+    assert_eq!(
+        result(
+            cmd(dir.path())
+                .args(["--config", "config.toml", "config", "show"])
+                .output()
+                .unwrap()
+        )["rpc"],
+        "disabled"
+    );
+    let changed = result(
+        cmd(dir.path())
+            .args(["--market", &key(9).to_string(), "config", "show"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(changed["market"], key(9).to_string());
+    assert_eq!(
+        changed["program_id"],
+        "F8q85nw6UScZCBKBJqVAu7ZdYhmT9XRsm6TqZzJqXSNT"
+    );
+}
+#[test]
+fn pinned_protocol_needs_no_public_config_lookup_and_hosted_rpc_is_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let signer = Keypair::new();
+    let wallet = signer.pubkey();
+    std::fs::write(
+        dir.path().join("key.json"),
+        serde_json::to_vec(&signer.to_bytes().to_vec()).unwrap(),
+    )
+    .unwrap();
+    let market = "8wceBTFDAiC9WiT3xZGRf9Nf4xrz8eBCxExBtDWz1Som";
+    let mut data = b"FOSSAV20".to_vec();
+    data.extend(key(4).as_ref());
+    data.extend(
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+            .parse::<Pubkey>()
+            .unwrap()
+            .as_ref(),
+    );
+    let account = json!({"owner":"F8q85nw6UScZCBKBJqVAu7ZdYhmT9XRsm6TqZzJqXSNT","lamports":1,"executable":false,"data":[STANDARD.encode(data),"base64"]});
+    let paths = Arc::new(Mutex::new(Vec::new()));
+    let seen = paths.clone();
+    let mock = mock(move |path, req| {
+        seen.lock().unwrap().push(path.to_owned());
+        assert_eq!(req["method"], "getAccountInfo");
+        rpc(
+            req,
+            json!({"context":{"slot":9},"value":if req["params"][0]==market {account.clone()}else{Value::Null}}),
+        )
+    });
+    let value = result(
+        cmd(dir.path())
+            .args([
+                "--api-url",
+                &mock.url,
+                "--keypair",
+                "key.json",
+                "provider",
+                "show",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert!(value["provider"].is_null());
+    assert_eq!(
+        *paths.lock().unwrap(),
+        vec!["/v1/providers/rpc", "/v1/providers/rpc"]
+    );
+    paths.lock().unwrap().clear();
+    let value = result(
+        cmd(dir.path())
+            .args([
+                "--api-url",
+                "http://127.0.0.1:1",
+                "--rpc-url",
+                &mock.url,
+                "--wallet",
+                &wallet.to_string(),
+                "provider",
+                "show",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert!(value["provider"].is_null());
+    assert_eq!(*paths.lock().unwrap(), vec!["/", "/"]);
+}
+
+#[test]
+fn argument_diagnostics_identify_missing_values_and_conflicts_without_echoing_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = cmd(dir.path()).args(["--rpc-url"]).output().unwrap();
+    let value: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(value["error"]["message"], "--rpc-url requires a value");
+    let output = cmd(dir.path())
+        .args([
+            "--hosted-rpc",
+            "--rpc-url",
+            "https://rpc.example/?credential=secret-value",
+            "config",
+            "show",
+        ])
+        .output()
+        .unwrap();
+    let value: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(
+        value["error"]["message"],
+        "--rpc-url and --hosted-rpc cannot be used together"
+    );
+    assert!(!value.to_string().contains("secret-value"));
 }
