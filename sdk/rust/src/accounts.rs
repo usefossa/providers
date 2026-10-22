@@ -331,7 +331,9 @@ impl Decode for TermsBook {
         let (d, model, limit, count) = book(a, p, Self::MAGIC, TERMS_LEN)?;
         let mut entries = Vec::with_capacity(count);
         for (slot, t) in d[48..48 + count * TERMS_LEN]
-            .chunks_exact(TERMS_LEN)
+            .as_chunks::<TERMS_LEN>()
+            .0
+            .iter()
             .enumerate()
         {
             let terms = OfferTerms {
@@ -367,7 +369,9 @@ impl Decode for CapacityBook {
     fn decode(_: &Pubkey, a: &RawAccount, p: &Pubkey) -> Result<Self> {
         let (d, model, limit, count) = book(a, p, Self::MAGIC, CAPACITY_LEN)?;
         let entries = d[48..48 + count * CAPACITY_LEN]
-            .chunks_exact(CAPACITY_LEN)
+            .as_chunks::<CAPACITY_LEN>()
+            .0
+            .iter()
             .map(|c| Capacity {
                 funded_bond: n64(c, 0),
                 exposure: n64(c, 8),
@@ -550,7 +554,7 @@ impl Decode for ReceiptBucket {
     fn decode(_: &Pubkey, a: &RawAccount, p: &Pubkey) -> Result<Self> {
         let d = state(a, p, Self::MAGIC, RECEIPT_BUCKET_LEN)?;
         let mut frontier = [[0; 32]; 16];
-        for (entry, bytes) in frontier.iter_mut().zip(d[224..].chunks_exact(32)) {
+        for (entry, bytes) in frontier.iter_mut().zip(d[224..].as_chunks::<32>().0.iter()) {
             entry.copy_from_slice(bytes);
         }
         let v = Self {

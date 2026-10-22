@@ -143,7 +143,7 @@ fn version_and_offline_validation_need_no_config_network_or_keys() {
     let version = cmd(dir.path()).arg("--version").output().unwrap();
     assert_eq!(
         String::from_utf8(version.stdout).unwrap(),
-        "fossa-provider 0.2.0\n"
+        format!("fossa-provider {}\n", env!("CARGO_PKG_VERSION"))
     );
     let raw = b"{ \"name\": \"Example\", \"endpoint\": \"https://example.com/infer\" }\n";
     std::fs::write(dir.path().join("provider.json"), raw).unwrap();

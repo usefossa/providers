@@ -160,7 +160,9 @@ impl ReceiptProof {
         while hashes.len() > 1 {
             siblings.push(hashes[position ^ 1]);
             hashes = hashes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| node(&pair[0], &pair[1]))
                 .collect();
             position /= 2;
