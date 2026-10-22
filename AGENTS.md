@@ -1,6 +1,6 @@
 # providers
 
-private `usefossa/providers`. follow [workspace rules](../AGENTS.md). keep repository private; never publish packages without explicit authorization.
+provider cli, rust sdk and metadata schema for fossa. [documentation](https://fossa.ag/docs/providers/cli).
 
 - `sdk/rust/`: complete protocol sdk; offline builders, typed accounts, pooled rpc and signing.
 - `cli/`: noninteractive rust binary using sdk. help and linked website docs replace skills.
@@ -8,7 +8,7 @@ private `usefossa/providers`. follow [workspace rules](../AGENTS.md). keep repos
 
 ## workflow
 
-- read implementation first. use subagents only when requested; assign separate ownership and finish sdk tests before cli implementation.
+- read implementation first. use subagents only when requested.
 - no commits, pushes, deployments or services unless requested. tooling releases never authorize onboarding, signing, program deployment or fund movement.
 - keep prose/comments lowercase and compact. preserve exact identifiers, paths, commands and user-facing strings. label every fenced code block with its language.
 - configuration and signer files stay outside git. examples use placeholders. never log secrets or signed transaction bytes.
@@ -17,5 +17,3 @@ private `usefossa/providers`. follow [workspace rules](../AGENTS.md). keep repos
 - schema consumers vendor independent copies; no sibling runtime dependencies or schema downloads. use `bun schema/sync.ts --check` with explicit affected targets.
 - before requested commit/push, run `cargo fmt --all --check`, `cargo test --workspace --locked`, `cargo clippy --workspace --all-targets --locked -- -D warnings` and final diff review. tests use synthetic keys and mock rpc only.
 - bump affected semver for behavior changes; tag requested releases `vX.Y.Z`. commits use `[fix]`, `[feat]`, `[add]`, `[update]`, lowercase single line, no attribution.
-
-program source and upgrades belong in `programs/`; maintained provider runtime belongs in `stealth/`.
