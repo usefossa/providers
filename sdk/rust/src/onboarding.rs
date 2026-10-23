@@ -48,7 +48,7 @@ pub async fn plan(
     protocol: &Protocol,
     config: &OnboardConfig,
 ) -> Result<OnboardingPlan> {
-    crate::instruction::book_sizes(config.book_limit)?;
+    let [terms_size, capacity_size] = crate::instruction::book_sizes(config.book_limit)?;
     config.document.encode()?;
     let mut seen = std::collections::HashSet::new();
     for model in &config.models {
@@ -99,6 +99,8 @@ pub async fn plan(
             return Ok(plan);
         }
     }
+    let mut book_rent = None;
+    let mut source_checked = false;
     for desired in &config.models {
         let id = address::model_id(&desired.id);
         let model_key = address::model(&protocol.program, &protocol.market, &id).0;
@@ -207,9 +209,25 @@ pub async fn plan(
                 terms: terms.pubkey(),
                 capacity: capacity.pubkey(),
             };
-            let mut instructions = rpc
-                .create_model_books(protocol, config.payer, keys, config.book_limit)
-                .await?;
+            let (terms_rent, capacity_rent) = match book_rent {
+                Some(rent) => rent,
+                None => {
+                    let (terms, capacity) =
+                        tokio::join!(rpc.rent(terms_size), rpc.rent(capacity_size));
+                    let rent = (terms?, capacity?);
+                    book_rent = Some(rent);
+                    rent
+                }
+            };
+            let mut instructions = vec![
+                protocol.create_account(config.payer, keys.terms, terms_rent, terms_size)?,
+                protocol.create_account(
+                    config.payer,
+                    keys.capacity,
+                    capacity_rent,
+                    capacity_size,
+                )?,
+            ];
             instructions.push(protocol.initialize_model(InitializeModel {
                 model: keys,
                 provider: config.provider,
@@ -259,8 +277,11 @@ pub async fn plan(
         }
         if capacity.funded_bond < desired.bond_target {
             let amount = desired.bond_target - capacity.funded_bond;
-            if let Some(account) = rpc.raw_account(source).await? {
-                TokenAccount::decode(&account)?.validate(&protocol.mint, &config.provider)?;
+            if !source_checked {
+                if let Some(account) = rpc.raw_account(source).await? {
+                    TokenAccount::decode(&account)?.validate(&protocol.mint, &config.provider)?;
+                }
+                source_checked = true;
             }
             plan.steps.push(PlanStep::new(
                 format!("fund bond {}: {amount} atomic units", desired.id),

@@ -132,6 +132,41 @@ fn rpc_response(body: &[u8], result: Value) -> (u16, Value) {
     )
 }
 
+#[tokio::test]
+async fn confirmation_deadline_bounds_slow_rpc_work() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rpc = RpcClient::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let task = tokio::spawn(async move {
+        let (_socket, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    let start = tokio::time::Instant::now();
+    assert!(matches!(
+        rpc.confirm(&pending(), Duration::from_millis(20)).await,
+        Err(Error::Timeout)
+    ));
+    assert!(start.elapsed() < Duration::from_millis(500));
+    task.abort();
+}
+
+#[tokio::test]
+async fn filtered_snapshot_enforces_requested_context_floor() {
+    let mock = spawn_mock(|_, _, body| {
+        let q: Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(q["params"][1]["minContextSlot"], 100);
+        assert_eq!(q["params"][1]["filters"], json!([{ "dataSize": 736 }]));
+        rpc_response(body, json!({"context":{"slot":99}, "value":[]}))
+    })
+    .await;
+    assert!(
+        RpcClient::new(&mock.url)
+            .unwrap()
+            .program_snapshot_at(key(1), vec![json!({"dataSize":736})], 100)
+            .await
+            .is_err()
+    );
+}
+
 #[test]
 fn offline_signing_persistence_rejects_tampering_and_never_overwrites_journal() {
     let pending = pending();
@@ -383,6 +418,76 @@ async fn onboarding_plans_registration_then_requires_real_admin_approval() {
     assert_eq!(plan.blockers.len(), 1);
 }
 
+#[tokio::test]
+async fn onboarding_reuses_book_rents_and_source_validation_within_one_plan() {
+    let p = protocol();
+    let provider = key(10);
+    let mut market = b"FOSSAV20".to_vec();
+    market.extend(provider.as_ref());
+    market.extend(p.mint.as_ref());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let seen = calls.clone();
+    let mock = spawn_mock(move |_, _, body| {
+        let q: Value = serde_json::from_slice(body).unwrap();
+        seen.lock().unwrap().push((q["method"].clone(), q["params"][0].clone()));
+        let result = match q["method"].as_str().unwrap() {
+            "getAccountInfo" => json!({"context":{"slot":1},"value":if q["params"][0] == p.market.to_string() { json!({"owner":p.program.to_string(),"lamports":1,"executable":false,"data":[STANDARD.encode(&market),"base64"]}) } else { Value::Null }}),
+            "getMinimumBalanceForRentExemption" => json!(1000),
+            other => panic!("unexpected {other}"),
+        };
+        rpc_response(body, result)
+    }).await;
+    let document = DocumentRef::new([1; 32], "https://example.com/metadata.json").unwrap();
+    let config = onboarding::OnboardConfig {
+        provider,
+        payer: provider,
+        admin: None,
+        document: document.clone(),
+        book_limit: 16,
+        models: (0..3)
+            .map(|n| onboarding::ModelConfig {
+                id: format!("example/model{n}"),
+                document: document.clone(),
+                terms: OfferTerms {
+                    rates: amount::Rates {
+                        input: 1,
+                        cached: 1,
+                        output: 1,
+                    },
+                    speed_tps: 1,
+                    capacity: 1,
+                    private: false,
+                    active: true,
+                },
+                bond_target: 100,
+                slot: None,
+            })
+            .collect(),
+    };
+    let plan = onboarding::plan(&RpcClient::new(&mock.url).unwrap(), &p, &config)
+        .await
+        .unwrap();
+    assert!(plan.blockers.is_empty());
+    assert_eq!(plan.steps.len(), 11);
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 8);
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|(method, _)| method == "getMinimumBalanceForRentExemption")
+            .count(),
+        2
+    );
+    let source = address::associated_token(&p.mint, &provider).to_string();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|(_, address)| address == &source)
+            .count(),
+        1
+    );
+}
+
 #[test]
 fn inference_v1_v2_headers_verify_exact_body_owner_booking_and_deadline() {
     let p = protocol();
@@ -469,14 +574,106 @@ async fn uncertain_status_preserves_pending_bytes_and_reports_timeout() {
         Err(Error::Timeout)
     ));
     assert_eq!(pending.wire_base64, before);
-    let mock=spawn_mock(|_,_,body|rpc_response(body,json!({"context":{"slot":1},"value":[{"slot":1,"confirmations":0,"err":{"InstructionError":[0,{"Custom":4}]},"confirmationStatus":"processed"}]}))).await;
+    for label in [Some("processed"), None] {
+        let mock = spawn_mock(move |_, _, body| {
+            let query: Value = serde_json::from_slice(body).unwrap();
+            assert_eq!(query["method"], "getSignatureStatuses");
+            let mut status =
+                json!({"slot":1,"confirmations":0,"err":{"InstructionError":[0,{"Custom":4}]}});
+            if let Some(label) = label {
+                status["confirmationStatus"] = json!(label);
+            }
+            rpc_response(body, json!({"context":{"slot":1},"value":[status]}))
+        })
+        .await;
+        let rpc = RpcClient::new(&mock.url).unwrap();
+        assert!(matches!(
+            rpc.confirm(&pending, Duration::ZERO).await,
+            Err(Error::Timeout)
+        ));
+        assert_eq!(
+            rpc.submit(&pending).await.unwrap().to_string(),
+            pending.signature
+        );
+        assert_eq!(pending.wire_base64, before);
+    }
+    let mock=spawn_mock(|_,_,body|rpc_response(body,json!({"context":{"slot":1},"value":[{"slot":1,"confirmations":null,"err":{"InstructionError":[0,{"Custom":4}]}}]}))).await;
+    let rpc = RpcClient::new(&mock.url).unwrap();
     assert!(matches!(
-        RpcClient::new(&mock.url)
-            .unwrap()
-            .confirm(&pending, Duration::ZERO)
-            .await,
-        Err(Error::Timeout)
+        rpc.confirm(&pending, Duration::ZERO).await,
+        Err(Error::Transaction(_))
     ));
+    assert!(matches!(
+        rpc.submit(&pending).await,
+        Err(Error::Transaction(_))
+    ));
+}
+
+#[tokio::test]
+async fn signature_status_requires_explicit_failure_and_confirmation_evidence() {
+    let pending = pending();
+    let before = pending.wire_base64.clone();
+    for status in [
+        json!({"slot":1}),
+        json!({"slot":1,"err":null}),
+        json!({"slot":1,"confirmations":null}),
+        json!({"slot":1,"confirmationStatus":"confirmed"}),
+        json!({"slot":1,"err":null,"confirmationStatus":null}),
+        json!({"slot":1,"err":false,"confirmationStatus":"confirmed"}),
+        json!({"slot":1,"err":0,"confirmationStatus":"confirmed"}),
+        json!({"slot":1,"err":[],"confirmationStatus":"confirmed"}),
+        json!({"slot":1,"err":"","confirmationStatus":"confirmed"}),
+        json!({"slot":1,"err":{},"confirmationStatus":"confirmed"}),
+    ] {
+        let mock = spawn_mock(move |_, _, body| {
+            let query: Value = serde_json::from_slice(body).unwrap();
+            assert_eq!(query["method"], "getSignatureStatuses");
+            rpc_response(body, json!({"context":{"slot":1},"value":[status]}))
+        })
+        .await;
+        let rpc = RpcClient::new(&mock.url).unwrap();
+        assert!(matches!(
+            rpc.confirm(&pending, Duration::ZERO).await,
+            Err(Error::Invalid("signature status evidence"))
+        ));
+        assert!(matches!(
+            rpc.submit(&pending).await,
+            Err(Error::Invalid("signature status evidence"))
+        ));
+        assert_eq!(pending.wire_base64, before);
+    }
+    for status in [
+        json!({"slot":1,"err":null,"confirmations":null}),
+        json!({"slot":1,"err":null,"confirmationStatus":"confirmed"}),
+    ] {
+        let mock = spawn_mock(move |_, _, body| {
+            rpc_response(body, json!({"context":{"slot":1},"value":[status]}))
+        })
+        .await;
+        let rpc = RpcClient::new(&mock.url)
+            .unwrap()
+            .with_commitment(rpc::Commitment::Confirmed);
+        assert!(rpc.confirm(&pending, Duration::ZERO).await.is_ok());
+        assert_eq!(
+            rpc.submit(&pending).await.unwrap().to_string(),
+            pending.signature
+        );
+    }
+    for error in [
+        json!("FutureTransactionFailure"),
+        json!({"FutureTransactionFailure":1}),
+    ] {
+        let mock = spawn_mock(move |_, _, body| rpc_response(body, json!({"context":{"slot":1},"value":[{"slot":1,"err":error,"confirmationStatus":"confirmed"}]}))).await;
+        let rpc = RpcClient::new(&mock.url).unwrap();
+        assert!(matches!(
+            rpc.confirm(&pending, Duration::ZERO).await,
+            Err(Error::Transaction(_))
+        ));
+        assert!(matches!(
+            rpc.submit(&pending).await,
+            Err(Error::Transaction(_))
+        ));
+    }
 }
 
 #[test]

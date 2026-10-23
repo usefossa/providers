@@ -562,6 +562,131 @@ fn offer_update_plans_keep_all_omitted_chain_terms_and_parse_real_rpc_strings() 
 }
 
 #[test]
+fn booking_budget_counts_every_permanent_slot_and_preserves_packet_limit() {
+    for count in [1u32, 16, 500, 4096] {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = key(5);
+        let user = key(10);
+        let id = fossa_sdk::address::model_id("example/model");
+        let (model, bump) = fossa_sdk::address::model(&key(1), &key(2), &id);
+        let raw = |bytes: Vec<u8>| json!({"owner":key(1).to_string(),"lamports":1,"executable":false,"data":[STANDARD.encode(bytes),"base64"]});
+        let mut m = vec![0; 144];
+        m[..8].copy_from_slice(b"MODELV20");
+        m[8..40].copy_from_slice(key(2).as_ref());
+        m[40..72].copy_from_slice(&id);
+        m[72..104].copy_from_slice(key(6).as_ref());
+        m[104..136].copy_from_slice(key(7).as_ref());
+        m[136..140].copy_from_slice(&count.to_le_bytes());
+        m[140] = bump;
+        let mut u = vec![0; 120];
+        u[..8].copy_from_slice(b"USER0V20");
+        u[8..40].copy_from_slice(wallet.as_ref());
+        u[40..72].copy_from_slice(key(2).as_ref());
+        u[72..80].copy_from_slice(&1_000_000u64.to_le_bytes());
+        u[80..112].copy_from_slice(key(11).as_ref());
+        u[112] = fossa_sdk::address::vault(&key(1), &user).1;
+        let mut t = vec![0; 48 + count as usize * 120];
+        let mut c = vec![0; 48 + count as usize * 32];
+        for (book, magic) in [(&mut t, b"TERMSV20"), (&mut c, b"CAPACV20")] {
+            book[..8].copy_from_slice(magic);
+            book[8..40].copy_from_slice(model.as_ref());
+            book[40..44].copy_from_slice(&count.to_le_bytes());
+            book[44..48].copy_from_slice(&count.to_le_bytes());
+        }
+        for slot in 0..count as usize {
+            let term = &mut t[48 + slot * 120..48 + (slot + 1) * 120];
+            term[..32].copy_from_slice(key(12).as_ref());
+            term[32..64].copy_from_slice(key(13).as_ref());
+            term[64..96].copy_from_slice(key(14).as_ref());
+            for offset in [96, 100, 104] {
+                term[offset..offset + 4].copy_from_slice(&1_000_000u32.to_le_bytes());
+            }
+            term[108..110].copy_from_slice(&1u16.to_le_bytes());
+            term[111] = u8::from(slot + 1 == count as usize);
+            term[112] = 1;
+            term[113] = fossa_sdk::address::bond(&key(1), &model, slot as u32).1;
+            term[116..120].copy_from_slice(&1u32.to_le_bytes());
+            c[48 + slot * 32..56 + slot * 32].copy_from_slice(&1_000_000u64.to_le_bytes());
+        }
+        let (m, u, t, c) = (raw(m), raw(u), raw(t), raw(c));
+        let mock = mock(move |_, req| {
+            rpc(
+                req,
+                match req["method"].as_str().unwrap() {
+                    "getAccountInfo" => {
+                        json!({"context":{"slot":9},"value":if req["params"][0] == key(2).to_string() { market_account(key(4)) } else if req["params"][0] == user.to_string() {u.clone()} else {m.clone()}})
+                    }
+                    "getMultipleAccounts" => json!({"context":{"slot":9},"value":[t,c]}),
+                    "getMinimumBalanceForRentExemption" => json!(1000),
+                    method => panic!("unexpected {method}"),
+                },
+            )
+        });
+        let mut command = cmd(dir.path());
+        protocol_args(&mut command, &mock.url, wallet);
+        let plan = result(
+            command
+                .args([
+                    "booking",
+                    "create",
+                    "--user",
+                    &user.to_string(),
+                    "--model",
+                    "example/model",
+                    "--max-input",
+                    "1",
+                    "--max-output",
+                    "1",
+                    "--max-spend",
+                    "1",
+                    "--input-price-cap",
+                    "1",
+                    "--cached-price-cap",
+                    "1",
+                    "--output-price-cap",
+                    "1",
+                ])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(plan["details"]["candidate_slot"], count - 1);
+        let mut bytes = vec![2];
+        bytes.extend((12_000 + 200 * count).to_le_bytes());
+        assert_eq!(
+            plan["instructions"][0]["data_hex"],
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+        let instructions: Vec<_> = plan["instructions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|ix| {
+                let hex = ix["data_hex"].as_str().unwrap();
+                fossa_sdk::Instruction {
+                    program_id: ix["program"].as_str().unwrap().parse().unwrap(),
+                    data: (0..hex.len())
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                        .collect(),
+                    accounts: ix["accounts"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|a| fossa_sdk::AccountMeta {
+                            pubkey: a["address"].as_str().unwrap().parse().unwrap(),
+                            is_signer: a["signer"].as_bool().unwrap(),
+                            is_writable: a["writable"].as_bool().unwrap(),
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
+        PreparedTransaction::new(&instructions, wallet, Hash::default(), 100, 0).unwrap();
+        assert!(!dir.path().join("transactions").exists());
+    }
+}
+
+#[test]
 fn explicit_rpc_choice_overrides_other_transport_environment() {
     let dir = tempfile::tempdir().unwrap();
     let value = result(
@@ -631,7 +756,7 @@ fn simulation_failure_never_creates_journal_or_broadcasts() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(!dir.path().join("transactions").exists());
+    assert!(!dir.path().join("transactions/pending.json").exists());
 }
 #[test]
 fn onboarding_approval_is_explicit_and_blocked_execution_cannot_upload() {
@@ -674,7 +799,7 @@ fn onboarding_approval_is_explicit_and_blocked_execution_cannot_upload() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(!dir.path().join("transactions").exists());
+    assert!(!dir.path().join("transactions/pending.json").exists());
     let mut command = cmd(dir.path());
     protocol_args(&mut command, &mock.url, key(5));
     let value = result(

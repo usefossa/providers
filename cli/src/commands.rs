@@ -522,6 +522,11 @@ async fn transaction(
         TransactionCommand::Status { file } => (file, false),
         TransactionCommand::Resume { file } => (file, true),
     };
+    let _journal_lock = runtime::JournalLock::acquire(
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )?;
     let pending = PendingTransaction::load(path)?;
     let rpc = runtime::rpc(config)?;
     let signature = pending.validate()?;
@@ -874,6 +879,9 @@ async fn book(rt: &Runtime, args: BookArgs) -> Result<Value> {
     let booking = key.pubkey();
     let payer = rt.payer()?;
     let ix = vec![
+        fossa_sdk::transaction::compute_unit_limit(
+            12_000 + 200 * terms.entries.len().min(4096) as u32,
+        ),
         rt.protocol
             .create_account(payer, booking, rt.rpc.rent(BOOKING_LEN).await?, BOOKING_LEN)?,
         rt.protocol.book(

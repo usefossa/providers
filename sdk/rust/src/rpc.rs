@@ -318,13 +318,30 @@ impl RpcClient {
         program: Pubkey,
         filters: Vec<Value>,
     ) -> Result<ContextValue<Vec<(Pubkey, RawAccount)>>> {
+        self.program_snapshot_at(program, filters, 0).await
+    }
+    pub async fn program_snapshot_at(
+        &self,
+        program: Pubkey,
+        filters: Vec<Value>,
+        min_context_slot: u64,
+    ) -> Result<ContextValue<Vec<(Pubkey, RawAccount)>>> {
         #[derive(Deserialize)]
         struct Entry {
             #[serde(with = "crate::serde_pubkey")]
             pubkey: Pubkey,
             account: WireAccount,
         }
-        let result: ContextValue<Vec<Entry>> = self.call("getProgramAccounts", json!([program.to_string(), {"encoding":"base64","commitment":self.commitment,"withContext":true,"filters":filters}])).await?;
+        let mut options = self.read_options(min_context_slot);
+        options["withContext"] = json!(true);
+        options["filters"] = json!(filters);
+        let result: ContextValue<Vec<Entry>> = self
+            .call("getProgramAccounts", json!([program.to_string(), options]))
+            .await?;
+        ensure(
+            result.context.slot >= min_context_slot,
+            "RPC snapshot context slot",
+        )?;
         Ok(ContextValue {
             context: result.context,
             value: result
@@ -514,7 +531,7 @@ impl RpcClient {
             !signatures.is_empty() && signatures.len() <= 256,
             "signature batch size",
         )?;
-        let response: ContextValue<Vec<Option<SignatureStatus>>> = self
+        let response: ContextValue<Vec<Option<Value>>> = self
             .call(
                 "getSignatureStatuses",
                 json!([signatures.iter().map(ToString::to_string).collect::<Vec<_>>(),{"searchTransactionHistory":search_history}]),
@@ -524,15 +541,39 @@ impl RpcClient {
             response.value.len() == signatures.len(),
             "signature status count",
         )?;
-        Ok(response.value)
+        response
+            .value
+            .into_iter()
+            .map(|status| {
+                status
+                    .map(|status| {
+                        let error_valid = match status.get("err") {
+                            Some(Value::Null) => true,
+                            Some(Value::String(error)) => !error.is_empty(),
+                            Some(Value::Object(error)) => !error.is_empty(),
+                            _ => false,
+                        };
+                        ensure(
+                            error_valid
+                                && (status
+                                    .get("confirmationStatus")
+                                    .is_some_and(|label| !label.is_null())
+                                    || status.get("confirmations").is_some()),
+                            "signature status evidence",
+                        )?;
+                        Ok(serde_json::from_value(status)?)
+                    })
+                    .transpose()
+            })
+            .collect()
     }
     pub async fn submit(&self, pending: &PendingTransaction) -> Result<Signature> {
         let signature = pending.validate()?;
         if let Some(status) = self.pending_status(pending, &signature).await? {
-            if let Some(error) = status.err
-                && status.confirmation_status != Some(Commitment::Processed)
+            if let Some(error) = &status.err
+                && status.reached(Commitment::Confirmed)
             {
-                return Err(Error::Transaction(error));
+                return Err(Error::Transaction(error.clone()));
             }
             return Ok(signature);
         }
@@ -570,17 +611,28 @@ impl RpcClient {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut next_height_check = tokio::time::Instant::now();
         loop {
-            let status = if tokio::time::Instant::now() >= next_height_check {
-                next_height_check = tokio::time::Instant::now() + Duration::from_secs(5);
-                self.pending_status(pending, &signature).await?
+            let poll = async {
+                if tokio::time::Instant::now() >= next_height_check {
+                    next_height_check = tokio::time::Instant::now() + Duration::from_secs(5);
+                    self.pending_status(pending, &signature).await
+                } else {
+                    Ok(self
+                        .signature_statuses(std::slice::from_ref(&signature), false)
+                        .await?
+                        .remove(0))
+                }
+            };
+            // zero requests one reconciliation pass; positive timeouts bound all awaited rpc work.
+            let status = if timeout.is_zero() {
+                poll.await?
             } else {
-                self.signature_statuses(std::slice::from_ref(&signature), false)
-                    .await?
-                    .remove(0)
+                tokio::time::timeout_at(deadline, poll)
+                    .await
+                    .map_err(|_| Error::Timeout)??
             };
             if let Some(status) = status {
                 if let Some(err) = &status.err
-                    && status.confirmation_status != Some(Commitment::Processed)
+                    && status.reached(Commitment::Confirmed)
                 {
                     return Err(Error::Transaction(err.clone()));
                 }

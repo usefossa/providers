@@ -50,9 +50,14 @@ pub struct Runtime {
     pub options: Options,
     pub rpc: RpcClient,
     pub protocol: Protocol,
+    _journal_lock: Option<JournalLock>,
 }
 impl Runtime {
     pub async fn connect(config: Config, options: Options) -> Result<Self> {
+        let journal_lock = options
+            .execute
+            .then(|| JournalLock::acquire(&config.journal))
+            .transpose()?;
         let rpc = rpc(&config)?;
         let protocol = config.protocol();
         rpc.validate_market(&protocol).await?;
@@ -61,6 +66,7 @@ impl Runtime {
             options,
             rpc,
             protocol,
+            _journal_lock: journal_lock,
         })
     }
     pub fn wallet(&self) -> Result<Pubkey> {
@@ -152,7 +158,36 @@ fn secure_directory(path: &Path) -> Result<()> {
     builder.create(path)?;
     Ok(())
 }
+// keep this inode in place: the os releases ownership after crashes as well as normal exits.
+pub struct JournalLock(std::fs::File);
+impl JournalLock {
+    pub fn acquire(directory: &Path) -> Result<Self> {
+        secure_directory(directory)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(directory.join(".journal.lock"))?;
+        file.try_lock()
+            .map_err(|_| Error::Input("transaction journal is in use by another process".into()))?;
+        Ok(Self(file))
+    }
+}
+impl Drop for JournalLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
 pub fn archive_pending(path: &Path, pending: &PendingTransaction) -> Result<std::path::PathBuf> {
+    let current = PendingTransaction::load(path)?;
+    if current.wire_base64 != pending.wire_base64 || current.signature != pending.signature {
+        return Err(Error::Input(
+            "journal identity changed; pending journal preserved".into(),
+        ));
+    }
     let archive = path.with_file_name(format!("{}.json", pending.signature));
     if path == archive {
         return Ok(archive);
@@ -194,5 +229,69 @@ pub fn pending_error(pending: &PendingTransaction, path: &Path, error: fossa_sdk
         message: crate::sdk_message(&error),
         signature: pending.signature.clone(),
         journal: path.display().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn journal_lock_child() {
+        if let Some(path) = std::env::var_os("FOSSA_TEST_JOURNAL_LOCK") {
+            let acquired = JournalLock::acquire(Path::new(&path)).is_ok();
+            assert_eq!(
+                acquired,
+                std::env::var("FOSSA_TEST_LOCK_EXPECT").unwrap() == "free"
+            );
+        }
+    }
+    #[test]
+    fn journal_lock_excludes_other_processes_and_releases_without_deleting_inode() {
+        let directory = tempfile::tempdir().unwrap();
+        let check = |expected| {
+            assert!(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "runtime::tests::journal_lock_child"])
+                    .env("FOSSA_TEST_JOURNAL_LOCK", directory.path())
+                    .env("FOSSA_TEST_LOCK_EXPECT", expected)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        let lock = JournalLock::acquire(directory.path()).unwrap();
+        check("held");
+        drop(lock);
+        assert!(directory.path().join(".journal.lock").exists());
+        check("free");
+    }
+    #[test]
+    fn stale_archive_never_removes_replacement_pending_transaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let _lock = JournalLock::acquire(directory.path()).unwrap();
+        let signer = Keypair::new_from_array([7; 32]);
+        let pending = |byte| {
+            fossa_sdk::transaction::PreparedTransaction::new(
+                &[fossa_sdk::transaction::compute_unit_limit(1000)],
+                signer.pubkey(),
+                fossa_sdk::Hash::new_from_array([byte; 32]),
+                100,
+                1,
+            )
+            .unwrap()
+            .sign(&[&signer])
+            .unwrap()
+        };
+        let first = pending(1);
+        let second = pending(2);
+        let path = directory.path().join("pending.json");
+        first.save(&path).unwrap();
+        archive_pending(&path, &first).unwrap();
+        second.save(&path).unwrap();
+        assert!(archive_pending(&path, &first).is_err());
+        assert_eq!(
+            PendingTransaction::load(&path).unwrap().wire_base64,
+            second.wire_base64
+        );
     }
 }
